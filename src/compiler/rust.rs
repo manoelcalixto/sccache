@@ -414,33 +414,35 @@ fn rewrite_cached_dep_info_targets(dep_info: &Path, outputs: &[FileObjectSource]
     let contents = fs::read_to_string(dep_info)
         .with_context(|| format!("Failed to read dep-info file {}", dep_info.display()))?;
     let mut changed = false;
-    let rewritten = contents
-        .split_inclusive('\n')
-        .map(|line| {
-            let (line_without_newline, newline) = line
-                .strip_suffix('\n')
-                .map_or((line, ""), |line| (line, "\n"));
-            let Some((target, dependencies)) = line_without_newline.split_once(": ") else {
-                return line.to_owned();
-            };
-            let target = unescape_makefile_path(target);
-            let Some(file_name) = Path::new(&target).file_name() else {
-                return line.to_owned();
-            };
-            let Some(replacement) = replacements.get::<str>(&file_name.to_string_lossy()) else {
-                return line.to_owned();
-            };
-            if Path::new(&target) == *replacement {
-                return line.to_owned();
-            }
+    let mut rewritten = String::with_capacity(contents.len());
+    for line in contents.split_inclusive('\n') {
+        let (line_without_newline, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |line| (line, "\n"));
+        let Some((target, dependencies)) = line_without_newline.split_once(": ") else {
+            rewritten.push_str(line);
+            continue;
+        };
+        let target = unescape_makefile_path(target);
+        let Some(file_name) = Path::new(&target).file_name() else {
+            rewritten.push_str(line);
+            continue;
+        };
+        let Some(replacement) = replacements.get::<str>(&file_name.to_string_lossy()) else {
+            rewritten.push_str(line);
+            continue;
+        };
+        if Path::new(&target) == *replacement {
+            rewritten.push_str(line);
+            continue;
+        }
 
-            changed = true;
-            format!(
-                "{}: {dependencies}{newline}",
-                escape_makefile_path(replacement)
-            )
-        })
-        .collect::<String>();
+        changed = true;
+        rewritten.push_str(&escape_makefile_path(replacement));
+        rewritten.push_str(": ");
+        rewritten.push_str(dependencies);
+        rewritten.push_str(newline);
+    }
 
     if changed {
         fs::write(dep_info, rewritten)

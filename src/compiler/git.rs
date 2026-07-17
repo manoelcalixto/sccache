@@ -60,9 +60,10 @@ impl GitWorktreeContext {
         };
 
         Ok(Self {
-            root: fs::canonicalize(root).with_context(|| {
-                format!("Failed to resolve Git worktree root {}", root.display())
-            })?,
+            // Keep the spelling Cargo uses for paths. Canonicalization introduces
+            // platform-specific prefixes such as /private on macOS and \\?\ on
+            // Windows, preventing lexical worktree-relative path matching.
+            root: root.to_owned(),
             common_dir: fs::canonicalize(&common_dir).with_context(|| {
                 format!(
                     "Failed to resolve Git common directory {}",
@@ -120,7 +121,7 @@ mod tests {
         fs::create_dir_all(&nested)?;
 
         let context = GitWorktreeContext::discover(&nested)?.expect("Git context");
-        assert_eq!(context.root(), fs::canonicalize(&root)?);
+        assert_eq!(context.root(), root);
         assert_eq!(context.common_dir(), fs::canonicalize(root.join(".git"))?);
         assert_eq!(
             context.relative_path(&nested),
@@ -145,7 +146,7 @@ mod tests {
         fs::write(linked_git_dir.join("commondir"), "../..\n")?;
 
         let context = GitWorktreeContext::discover(&linked)?.expect("Git context");
-        assert_eq!(context.root(), fs::canonicalize(&linked)?);
+        assert_eq!(context.root(), linked);
         assert_eq!(context.common_dir(), fs::canonicalize(&common)?);
         Ok(())
     }

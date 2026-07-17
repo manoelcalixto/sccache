@@ -399,7 +399,7 @@ jobs:
           usesh: true
           sync: rsync
           copyback: false
-          prepare: pkg install -y ca_root_nss curl gmake gtar pot sudo
+          prepare: pkg install -y ca_root_nss curl git gmake gtar pot sudo
           run: |
             #####################################################################################
             ###  Prepare, build, and test

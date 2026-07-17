@@ -39,5 +39,6 @@ This mode is intentionally local:
 * Values actually read through `env!` are not normalized. A worktree-specific absolute value therefore causes a safe cache miss.
 * Crates that load proc macros keep `CARGO_*` environment paths worktree-specific because proc macros can observe those values without rustc reporting an env-dep.
 * User-provided `--remap-path-prefix` rules take precedence over sccache's worktree rule. Because their effective matches can differ between worktrees, compilations that use them remain worktree-specific.
+* Distributed compilation is disabled in worktree mode because worker path mappings cannot preserve the local worktree remap safely. Local and remote cache storage remain available.
 
 The automatic remap can make paths embedded by `file!`, debug information, diagnostics, and similar compiler output relative instead of absolute. Run `cargo clean` once after enabling or disabling this mode so Cargo does not reuse artifacts produced with the other path convention.

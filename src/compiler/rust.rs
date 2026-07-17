@@ -2082,6 +2082,13 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         let dist_command = None;
         #[cfg(feature = "dist-client")]
         let dist_command = (|| {
+            if self.git_worktrees {
+                debug!(
+                    "Distributed Rust compilation is disabled when {GIT_WORKTREES_ENV} is enabled"
+                );
+                return None;
+            }
+
             macro_rules! try_string_arg {
                 ($e:expr) => {
                     match $e {
@@ -3135,6 +3142,42 @@ LLVM version: 15.0.2
 
         assert!(may_load_proc_macro(&[dynamic]));
         assert!(!may_load_proc_macro(&["libdependency.rlib".into()]));
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn worktree_mode_disables_distributed_compilation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let compilation = RustCompilation {
+            executable: "rustc".into(),
+            host: "test-host".into(),
+            sysroot: temp.path().join("sysroot"),
+            rlib_dep_reader: None,
+            arguments: Vec::new(),
+            inputs: Vec::new(),
+            outputs: HashMap::new(),
+            crate_link_paths: Vec::new(),
+            crate_name: "worktree_test".into(),
+            crate_types: CrateTypes {
+                rlib: true,
+                staticlib: false,
+            },
+            dep_info: None,
+            cwd: temp.path().to_owned(),
+            env_vars: Vec::new(),
+            git_worktrees: true,
+        };
+        let mut path_transformer = dist::PathTransformer::new();
+
+        let (_, dist_command, cacheable) = <RustCompilation as Compilation<
+            ProcessCommandCreator,
+        >>::generate_compile_commands(
+            &compilation, &mut path_transformer, false
+        )?;
+
+        assert!(dist_command.is_none());
+        assert_eq!(cacheable, Cacheable::Yes);
+        Ok(())
     }
 
     #[test]

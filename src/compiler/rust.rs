@@ -360,11 +360,109 @@ fn has_user_path_remap_options(arguments: &[Argument<ArgData>]) -> bool {
     })
 }
 
-fn may_load_proc_macro(externs: &[PathBuf]) -> bool {
-    externs.iter().any(|path| {
-        path.extension()
-            .is_some_and(|extension| extension == DLL_EXTENSION)
-    })
+fn is_dynamic_extern(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == DLL_EXTENSION)
+}
+
+fn is_metadata_extern(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "rlib" || extension == "rmeta")
+}
+
+#[cfg(not(feature = "dist-client"))]
+fn may_load_proc_macro(externs: &[PathBuf], _crate_link_paths: &[PathBuf]) -> bool {
+    externs
+        .iter()
+        .any(|path| is_dynamic_extern(path) || is_metadata_extern(path))
+}
+
+#[cfg(feature = "dist-client")]
+fn dynamic_crate_names(crate_link_paths: &[PathBuf]) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for directory in crate_link_paths {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect Rust crate link path {}",
+                        directory.display()
+                    )
+                });
+            }
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if !is_dynamic_extern(&path) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let stem = stem.strip_prefix(DLL_PREFIX).unwrap_or(stem);
+            let crate_name = stem.rsplit_once('-').map_or(stem, |(name, _)| name);
+            names.insert(crate_name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(feature = "dist-client")]
+fn may_load_proc_macro(
+    externs: &[PathBuf],
+    crate_link_paths: &[PathBuf],
+    rlib_dep_reader: Option<&RlibDepReader>,
+    env_vars: &[(OsString, OsString)],
+) -> bool {
+    if externs.iter().any(|path| is_dynamic_extern(path)) {
+        return true;
+    }
+    let metadata_externs = externs
+        .iter()
+        .filter(|path| is_metadata_extern(path))
+        .collect::<Vec<_>>();
+    if metadata_externs.is_empty() {
+        return false;
+    }
+    let Some(rlib_dep_reader) = rlib_dep_reader else {
+        warn!(
+            "Keeping Rust metadata externs worktree-specific because metadata inspection is unavailable"
+        );
+        return true;
+    };
+    let dynamic_crate_names = match dynamic_crate_names(crate_link_paths) {
+        Ok(names) => names,
+        Err(error) => {
+            warn!("Keeping Rust metadata externs worktree-specific: {error:#}");
+            return true;
+        }
+    };
+    if dynamic_crate_names.is_empty() {
+        return false;
+    }
+
+    for metadata in metadata_externs {
+        match rlib_dep_reader.discover_rlib_deps(env_vars, metadata) {
+            Ok(dependencies) => {
+                if dependencies
+                    .iter()
+                    .any(|dependency| dynamic_crate_names.contains(dependency))
+                {
+                    return true;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "Keeping Rust metadata extern {} worktree-specific: {error:#}",
+                    metadata.display()
+                );
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn rust_arguments_for_worktree(
@@ -1674,20 +1772,48 @@ where
 
         let target_json_hash = hash_all(&target_json_files, pool);
 
+        #[cfg(feature = "dist-client")]
+        let proc_macro_detection = {
+            let externs = abs_externs.clone();
+            let crate_link_paths = self.parsed_args.crate_link_paths.clone();
+            let rlib_dep_reader = self.rlib_dep_reader.clone();
+            let env_vars = env_vars.clone();
+            pool.spawn_blocking(move || {
+                may_load_proc_macro(
+                    &externs,
+                    &crate_link_paths,
+                    rlib_dep_reader.as_deref(),
+                    &env_vars,
+                )
+            })
+        };
+        #[cfg(not(feature = "dist-client"))]
+        let proc_macro_detection = {
+            let externs = abs_externs.clone();
+            let crate_link_paths = self.parsed_args.crate_link_paths.clone();
+            pool.spawn_blocking(move || may_load_proc_macro(&externs, &crate_link_paths))
+        };
+        let proc_macro_detection = async move { proc_macro_detection.await.map_err(Error::from) };
+
         // Perform all hashing operations on the files.
-        let ((dep_info, source_hashes), extern_hashes, staticlib_hashes, target_json_hash) = futures::try_join!(
+        let (
+            (dep_info, source_hashes),
+            extern_hashes,
+            staticlib_hashes,
+            target_json_hash,
+            may_load_proc_macro,
+        ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
-            target_json_hash
+            target_json_hash,
+            proc_macro_detection
         )?;
         let RustDepInfo {
             source_files,
             absolute_source_files,
             mut env_deps,
         } = dep_info;
-        let may_load_proc_macro = may_load_proc_macro(&abs_externs);
-
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
         // Hash inputs:
@@ -2944,13 +3070,13 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
             break;
         }
 
-        let mut line_splits = line.splitn(2, ' ');
-        let num: usize = line_splits
+        let mut fields = line.split_whitespace();
+        let num: usize = fields
             .next()
             .expect("Zero strings from line split")
             .parse()
             .context("Could not parse number from rustc -Z ls")?;
-        let libstring = line_splits
+        let libstring = fields
             .next()
             .context("No lib string on line from rustc -Z ls")?;
         if num != dep_names.len() + 1 {
@@ -2959,8 +3085,6 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
                 libstring
             )
         }
-        assert!(line_splits.next().is_none());
-
         let mut libstring_splits = libstring.rsplitn(2, '-');
         // Most things get printed as ${LIBNAME}-${HASH} but for some things
         // (native code-only libraries?), ${LIBNAME} is all you get.
@@ -3133,8 +3257,8 @@ LLVM version: 15.0.2
     fn dynamic_externs_may_be_proc_macros() {
         let dynamic = PathBuf::from(format!("libderive.{DLL_EXTENSION}"));
 
-        assert!(may_load_proc_macro(&[dynamic]));
-        assert!(!may_load_proc_macro(&["libdependency.rlib".into()]));
+        assert!(is_dynamic_extern(&dynamic));
+        assert!(!is_dynamic_extern(Path::new("libdependency.rlib")));
     }
 
     #[cfg(feature = "dist-client")]
@@ -3877,6 +4001,21 @@ proc_macro false
         assert_eq!(res[0], "lucet_runtime");
         assert_eq!(res[1], "lucet_runtime_internals");
         assert_eq!(res[2], "lucet_runtime_macros");
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_parse_rustc_z_ls_with_dependency_details() {
+        let output = "Crate info:
+name proc_macro_facade
+proc_macro false
+=External Dependencies=
+1 std-ca8536218e109c03 hash 7ae38cdd2212e7f2 host_hash None kind Unconditional public
+2 env_proc_macro hash 4661971025e3f187 host_hash None kind MacrosOnly public
+
+";
+        let res = parse_rustc_z_ls(output).unwrap();
+        assert_eq!(res, vec!["std", "env_proc_macro"]);
     }
 
     #[cfg(feature = "dist-client")]

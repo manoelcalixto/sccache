@@ -135,17 +135,19 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
     );
 
     let proc_macro = build_env_proc_macro(&test_info)?;
-    compile_proc_macro_consumer(&test_info, &repository, &proc_macro)?;
+    let proc_macro_facade = build_proc_macro_facade(&test_info, &proc_macro)?;
+    let proc_macro_dir = proc_macro.parent().context("proc macro has no parent")?;
+    compile_proc_macro_consumer(&test_info, &repository, &proc_macro_facade, proc_macro_dir)?;
     let hits_before_proc_macro_linked = rust_cache_stat("cache_hits")?;
     let misses_before_proc_macro_linked = rust_cache_stat("cache_misses")?;
-    compile_proc_macro_consumer(&test_info, &linked, &proc_macro)?;
+    compile_proc_macro_consumer(&test_info, &linked, &proc_macro_facade, proc_macro_dir)?;
     ensure!(
         rust_cache_stat("cache_misses")? > misses_before_proc_macro_linked,
-        "a proc macro that can observe OUT_DIR must cause a worktree-specific miss"
+        "a re-exported proc macro that can observe OUT_DIR must cause a worktree-specific miss"
     );
     ensure!(
         rust_cache_stat("cache_hits")? == hits_before_proc_macro_linked,
-        "a proc macro unexpectedly reused another worktree's Cargo env entry"
+        "a re-exported proc macro unexpectedly reused another worktree's Cargo env entry"
     );
 
     clean_worktree(&test_info, &repository)?;
@@ -364,15 +366,48 @@ pub fn observed_out_dir(_input: TokenStream) -> TokenStream {
     )))
 }
 
+fn build_proc_macro_facade(test_info: &SccacheTest<'_>, proc_macro: &Path) -> Result<PathBuf> {
+    let source = test_info.tempdir.path().join("env_proc_macro_facade.rs");
+    let output_dir = test_info.tempdir.path().join("proc-macro-facade-target");
+    fs::create_dir_all(&output_dir)?;
+    fs::write(
+        &source,
+        r#"extern crate env_proc_macro;
+pub use env_proc_macro::observed_out_dir;
+"#,
+    )?;
+    let mut extern_arg = OsString::from("env_proc_macro=");
+    extern_arg.push(proc_macro);
+    Command::new("rustc")
+        .args([
+            "--crate-name",
+            "env_proc_macro_facade",
+            "--crate-type",
+            "lib",
+            "--emit=metadata,link",
+            "--extern",
+        ])
+        .arg(extern_arg)
+        .arg(&source)
+        .arg("--out-dir")
+        .arg(&output_dir)
+        .assert()
+        .try_success()?;
+    Ok(output_dir.join("libenv_proc_macro_facade.rmeta"))
+}
+
 fn compile_proc_macro_consumer(
     test_info: &SccacheTest<'_>,
     root: &Path,
-    proc_macro: &Path,
+    proc_macro_facade: &Path,
+    proc_macro_dir: &Path,
 ) -> Result<()> {
     let output_dir = Path::new("proc-macro-consumer-target");
     fs::create_dir_all(root.join(output_dir))?;
-    let mut extern_arg = OsString::from("env_proc_macro=");
-    extern_arg.push(proc_macro);
+    let mut extern_arg = OsString::from("env_proc_macro_facade=");
+    extern_arg.push(proc_macro_facade);
+    let mut dependency_path = OsString::from("dependency=");
+    dependency_path.push(proc_macro_dir);
     Command::new(SCCACHE_BIN.as_os_str())
         .arg("rustc")
         .args([
@@ -387,6 +422,8 @@ fn compile_proc_macro_consumer(
         .arg(output_dir)
         .arg("--extern")
         .arg(extern_arg)
+        .arg("-L")
+        .arg(dependency_path)
         .arg("src/proc_macro_consumer.rs")
         .envs(test_info.env.iter().cloned())
         .env("OUT_DIR", root.join("generated"))

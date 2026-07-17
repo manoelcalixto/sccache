@@ -35,6 +35,7 @@ This mode is intentionally local:
 * Linked worktrees created by `git worktree` share entries because they have the same Git common directory.
 * Independent clones do not share entries, even when they have the same remote URL.
 * Paths outside the worktree remain absolute cache-key inputs. Using the default `target` directory (or the same target path relative to every worktree root) gives the best results.
+* Source dependencies passed to rustc as absolute paths remain worktree-specific because rustc preserves those paths in dep-info files. Cargo normally passes project sources as relative paths.
 * Values actually read through `env!` are not normalized. A worktree-specific absolute value therefore causes a safe cache miss.
 * User-provided `--remap-path-prefix` rules take precedence over sccache's worktree rule.
 

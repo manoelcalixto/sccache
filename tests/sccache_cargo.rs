@@ -69,6 +69,19 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
     );
     ensure_dep_info_uses_current_worktree(&repository, &linked)?;
 
+    compile_absolute_input(&test_info, &repository)?;
+    let hits_before_absolute_linked = rust_cache_stat("cache_hits")?;
+    let misses_before_absolute_linked = rust_cache_stat("cache_misses")?;
+    compile_absolute_input(&test_info, &linked)?;
+    ensure!(
+        rust_cache_stat("cache_misses")? > misses_before_absolute_linked,
+        "an absolute source input must not share an entry across worktrees"
+    );
+    ensure!(
+        rust_cache_stat("cache_hits")? == hits_before_absolute_linked,
+        "an absolute source input unexpectedly reused another worktree's entry"
+    );
+
     clean_worktree(&test_info, &repository)?;
     build_worktree(&test_info, &repository, path_str(&repository)?)?;
     let misses_before_env_path = rust_cache_stat("cache_misses")?;
@@ -169,6 +182,29 @@ fn build_worktree(test_info: &SccacheTest<'_>, root: &Path, env_value: &str) -> 
         .envs(test_info.env.iter().cloned())
         .env("CARGO_TARGET_DIR", root.join("target"))
         .env("TEST_ENV_VAR", env_value)
+        .current_dir(root)
+        .assert()
+        .try_success()?;
+    Ok(())
+}
+
+fn compile_absolute_input(test_info: &SccacheTest<'_>, root: &Path) -> Result<()> {
+    let output_dir = root.join("absolute-target");
+    fs::create_dir_all(&output_dir)?;
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("rustc")
+        .args([
+            "--crate-name",
+            "absolute_input",
+            "--crate-type",
+            "lib",
+            "--emit=link,dep-info",
+            "--color=never",
+        ])
+        .arg("--out-dir")
+        .arg(&output_dir)
+        .arg(root.join("src/lib.rs"))
+        .envs(test_info.env.iter().cloned())
         .current_dir(root)
         .assert()
         .try_success()?;

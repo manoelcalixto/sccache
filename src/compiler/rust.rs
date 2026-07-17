@@ -470,7 +470,7 @@ async fn get_source_files_and_env_deps<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
+) -> Result<RustDepInfo>
 where
     T: CommandCreatorSync,
 {
@@ -502,23 +502,28 @@ where
         })
         .await?;
 
-    parsed.map(move |(files, env_deps)| {
-        trace!(
-            "[{}]: got {} source files and {} env-deps from dep-info in {}",
-            crate_name,
-            files.len(),
-            env_deps.len(),
-            fmt_duration_as_secs(&start.elapsed())
-        );
-        // Just to make sure we capture temp_dir.
-        drop(temp_dir);
-        (files, env_deps)
-    })
+    let dep_info = parsed?;
+    trace!(
+        "[{}]: got {} source files and {} env-deps from dep-info in {}",
+        crate_name,
+        dep_info.source_files.len(),
+        dep_info.env_deps.len(),
+        fmt_duration_as_secs(&start.elapsed())
+    );
+    // Just to make sure we capture temp_dir.
+    drop(temp_dir);
+    Ok(dep_info)
+}
+
+struct RustDepInfo {
+    source_files: Vec<PathBuf>,
+    absolute_source_files: Vec<PathBuf>,
+    env_deps: Vec<(OsString, OsString)>,
 }
 
 /// Parse dependency info from `file` and return a Vec of files mentioned.
 /// Treat paths as relative to `cwd`.
-fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
+fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<RustDepInfo>
 where
     T: AsRef<Path>,
     U: AsRef<Path>,
@@ -526,14 +531,39 @@ where
     let mut f = fs::File::open(file.as_ref())?;
     let mut deps = String::new();
     f.read_to_string(&mut deps)?;
-    Ok((parse_dep_info(&deps, cwd), parse_env_dep_info(&deps)))
+    let source_paths = parse_dep_info_paths(&deps);
+    let absolute_source_files = source_paths
+        .iter()
+        .filter(|path| path.is_absolute())
+        .cloned()
+        .collect();
+    let mut source_files = source_paths
+        .into_iter()
+        .map(|path| cwd.as_ref().join(path))
+        .collect::<Vec<_>>();
+    source_files.sort();
+    Ok(RustDepInfo {
+        source_files,
+        absolute_source_files,
+        env_deps: parse_env_dep_info(&deps),
+    })
 }
 
+#[cfg(test)]
 fn parse_dep_info<T>(dep_info: &str, cwd: T) -> Vec<PathBuf>
 where
     T: AsRef<Path>,
 {
     let cwd = cwd.as_ref();
+    let mut deps = parse_dep_info_paths(dep_info)
+        .into_iter()
+        .map(|path| cwd.join(path))
+        .collect::<Vec<_>>();
+    deps.sort();
+    deps
+}
+
+fn parse_dep_info_paths(dep_info: &str) -> Vec<PathBuf> {
     // Just parse the first line, which should have the dep-info file and all
     // source files.
     let line = match dep_info.lines().next() {
@@ -575,9 +605,7 @@ where
         }
     }
 
-    let mut deps = deps.iter().map(|s| cwd.join(s)).collect::<Vec<_>>();
-    deps.sort();
-    deps
+    deps.into_iter().map(PathBuf::from).collect()
 }
 
 fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
@@ -1612,7 +1640,7 @@ where
         // Find all the source files and hash them
         let source_hashes_pool = pool.clone();
         let source_files_and_hashes_and_env_deps = async {
-            let (source_files, env_deps) = get_source_files_and_env_deps(
+            let dep_info = get_source_files_and_env_deps(
                 creator,
                 &self.parsed_args.crate_name,
                 &self.executable,
@@ -1622,8 +1650,8 @@ where
                 pool,
             )
             .await?;
-            let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
-            Ok((source_files, source_hashes, env_deps))
+            let source_hashes = hash_all(&dep_info.source_files, &source_hashes_pool).await?;
+            Ok((dep_info, source_hashes))
         };
 
         // Hash the contents of the externs listed on the commandline.
@@ -1668,17 +1696,17 @@ where
         let target_json_hash = hash_all(&target_json_files, pool);
 
         // Perform all hashing operations on the files.
-        let (
-            (source_files, source_hashes, mut env_deps),
-            extern_hashes,
-            staticlib_hashes,
-            target_json_hash,
-        ) = futures::try_join!(
+        let ((dep_info, source_hashes), extern_hashes, staticlib_hashes, target_json_hash) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
             target_json_hash
         )?;
+        let RustDepInfo {
+            source_files,
+            absolute_source_files,
+            mut env_deps,
+        } = dep_info;
 
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
@@ -1695,6 +1723,16 @@ where
             context
                 .common_dir()
                 .hash(&mut HashToDigest { digest: &mut m });
+            if absolute_source_files
+                .iter()
+                .any(|path| context.relative_path(path).is_some())
+            {
+                // rustc does not apply object-only remapping to dep-info dependency paths.
+                // Keep entries with absolute worktree inputs local so a cache hit cannot
+                // restore a dependency path that belongs to another worktree.
+                m.update(b"absolute-worktree-source");
+                context.root().hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to

@@ -14,7 +14,7 @@ use helpers::{SCCACHE_BIN, SccacheTest};
 use predicates::prelude::*;
 use serial_test::serial;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
@@ -50,8 +50,9 @@ fn test_rust_cargo_build_readonly() -> Result<()> {
 fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
     let git_worktrees = [("SCCACHE_GIT_WORKTREES", OsString::from("1"))];
     let test_info = SccacheTest::new(Some(&git_worktrees))?;
-    let repository = test_info.tempdir.path().join("repository");
-    let linked = test_info.tempdir.path().join("linked");
+    let worktree_parent = worktree_test_parent(test_info.tempdir.path())?;
+    let repository = worktree_parent.join("repository");
+    let linked = worktree_parent.join("linked");
     copy_worktree_test_crate(&repository)?;
     init_git_repository(&repository)?;
     git(
@@ -195,6 +196,22 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
         "an independent clone unexpectedly reused a linked-worktree entry"
     );
     Ok(())
+}
+
+#[cfg(unix)]
+fn worktree_test_parent(tempdir: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::symlink;
+
+    let canonical = tempdir.join("canonical");
+    let alias = tempdir.join("alias");
+    fs::create_dir(&canonical)?;
+    symlink(&canonical, &alias)?;
+    Ok(alias)
+}
+
+#[cfg(not(unix))]
+fn worktree_test_parent(tempdir: &Path) -> Result<PathBuf> {
+    Ok(tempdir.to_owned())
 }
 
 fn path_str(path: &Path) -> Result<&str> {
@@ -402,7 +419,7 @@ fn rust_cache_stat(category: &str) -> Result<u64> {
 }
 
 fn ensure_dep_info_uses_current_worktree(repository: &Path, linked: &Path) -> Result<()> {
-    let repository = path_str(repository)?;
+    let repository_paths = [repository.to_owned(), fs::canonicalize(repository)?];
     let mut dep_info_files = 0;
     for entry in WalkDir::new(linked.join("target")) {
         let entry = entry?;
@@ -416,11 +433,14 @@ fn ensure_dep_info_uses_current_worktree(repository: &Path, linked: &Path) -> Re
         }
         dep_info_files += 1;
         let contents = fs::read_to_string(entry.path())?;
-        ensure!(
-            !contents.contains(repository),
-            "{} still references the original worktree",
-            entry.path().display()
-        );
+        for repository in &repository_paths {
+            ensure!(
+                !contents.contains(path_str(repository)?),
+                "{} still references the original worktree {}:\n{contents}",
+                entry.path().display(),
+                repository.display()
+            );
+        }
     }
     ensure!(dep_info_files > 0, "no dep-info files were generated");
     Ok(())

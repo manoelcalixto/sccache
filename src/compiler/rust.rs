@@ -290,12 +290,20 @@ fn discover_git_worktree(
 }
 
 fn worktree_relative_path(path: &Path, context: &GitWorktreeContext) -> Option<PathBuf> {
-    context.relative_path(path).map(|relative| {
-        if relative.as_os_str().is_empty() {
-            PathBuf::from(".")
-        } else {
-            relative.to_owned()
-        }
+    let relative = context
+        .relative_path(path)
+        .map(Path::to_owned)
+        .or_else(|| {
+            if !path.is_absolute() {
+                return None;
+            }
+            let canonical = fs::canonicalize(path).ok()?;
+            context.relative_path(&canonical).map(Path::to_owned)
+        })?;
+    Some(if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
     })
 }
 
@@ -362,49 +370,18 @@ fn rust_arguments_for_worktree(
         return arguments.to_owned();
     };
 
-    let mut remap = context.root().as_os_str().to_owned();
-    remap.push("=.");
-    let mut result = Vec::with_capacity(arguments.len() + 1);
-    result.push(Argument::WithValue(
-        "--remap-path-prefix",
-        ArgData::PassThrough(remap),
-        ArgDisposition::Separated,
-    ));
+    let mut result = Vec::with_capacity(arguments.len() + 2);
+    for root in context.roots() {
+        let mut remap = root.as_os_str().to_owned();
+        remap.push("=.");
+        result.push(Argument::WithValue(
+            "--remap-path-prefix",
+            ArgData::PassThrough(remap),
+            ArgDisposition::Separated,
+        ));
+    }
     result.extend(arguments.iter().cloned());
     result
-}
-
-fn unescape_makefile_path(path: &str) -> String {
-    let mut result = String::with_capacity(path.len());
-    let mut chars = path.chars().peekable();
-    while let Some(character) = chars.next() {
-        match character {
-            '\\' => result.push(chars.next().unwrap_or('\\')),
-            '$' if chars.peek() == Some(&'$') => {
-                chars.next();
-                result.push('$');
-            }
-            _ => result.push(character),
-        }
-    }
-    result
-}
-
-fn escape_makefile_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .chars()
-        .fold(String::new(), |mut result, character| {
-            match character {
-                '\\' => result.push_str("\\\\"),
-                ' ' | '#' | ':' => {
-                    result.push('\\');
-                    result.push(character);
-                }
-                '$' => result.push_str("$$"),
-                _ => result.push(character),
-            }
-            result
-        })
 }
 
 fn rewrite_cached_dep_info_targets(dep_info: &Path, outputs: &[FileObjectSource]) -> Result<()> {
@@ -429,8 +406,9 @@ fn rewrite_cached_dep_info_targets(dep_info: &Path, outputs: &[FileObjectSource]
             rewritten.push_str(line);
             continue;
         };
-        let target = unescape_makefile_path(target);
-        let Some(file_name) = Path::new(&target).file_name() else {
+        // rustc writes dep-info targets as native paths. In particular, Windows
+        // separators are literal backslashes rather than Makefile escapes.
+        let Some(file_name) = Path::new(target).file_name() else {
             rewritten.push_str(line);
             continue;
         };
@@ -438,13 +416,13 @@ fn rewrite_cached_dep_info_targets(dep_info: &Path, outputs: &[FileObjectSource]
             rewritten.push_str(line);
             continue;
         };
-        if Path::new(&target) == *replacement {
+        if Path::new(target) == *replacement {
             rewritten.push_str(line);
             continue;
         }
 
         changed = true;
-        rewritten.push_str(&escape_makefile_path(replacement));
+        rewritten.push_str(&replacement.to_string_lossy());
         rewritten.push_str(": ");
         rewritten.push_str(dependencies);
         rewritten.push_str(newline);
@@ -1722,7 +1700,7 @@ where
                 .hash(&mut HashToDigest { digest: &mut m });
             if absolute_source_files
                 .iter()
-                .any(|path| context.relative_path(path).is_some())
+                .any(|path| worktree_relative_path(path, context).is_some())
             {
                 // rustc does not apply object-only remapping to dep-info dependency paths.
                 // Keep entries with absolute worktree inputs local so a cache hit cannot
@@ -3198,10 +3176,44 @@ LLVM version: 15.0.2
 
         let expected = format!(
             "{}: ./src/lib.rs\n{}: ./src/lib.rs\n./src/lib.rs:\n",
-            escape_makefile_path(&output),
-            escape_makefile_path(&dep_info)
+            output.display(),
+            dep_info.display()
         );
         assert_eq!(fs::read_to_string(dep_info)?, expected);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_dep_info_targets_preserve_windows_separators() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dep_info = temp.path().join("target/current/example.d");
+        let output = temp.path().join("target/current/example.rlib");
+        fs::create_dir_all(dep_info.parent().expect("dep-info parent"))?;
+        fs::write(
+            &dep_info,
+            "C:\\old\\worktree\\target\\example.rlib: src\\lib.rs\n\
+C:\\old\\worktree\\target\\example.d: src\\lib.rs\n",
+        )?;
+        let outputs = vec![
+            FileObjectSource {
+                key: "example.rlib".into(),
+                path: output.clone(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "example.d".into(),
+                path: dep_info.clone(),
+                optional: false,
+            },
+        ];
+
+        rewrite_cached_dep_info_targets(&dep_info, &outputs)?;
+
+        let contents = fs::read_to_string(&dep_info)?;
+        assert!(contents.contains(output.to_string_lossy().as_ref()));
+        assert!(contents.contains(dep_info.to_string_lossy().as_ref()));
+        assert!(!contents.contains("C:\\old\\worktree"));
         Ok(())
     }
 

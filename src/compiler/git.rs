@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitWorktreeContext {
     root: PathBuf,
+    canonical_root: PathBuf,
     common_dir: PathBuf,
 }
 
@@ -45,6 +46,8 @@ impl GitWorktreeContext {
     }
 
     fn from_git_dir(root: &Path, git_dir: &Path) -> Result<Self> {
+        let canonical_root = fs::canonicalize(root)
+            .with_context(|| format!("Failed to resolve Git worktree root {}", root.display()))?;
         let git_dir = fs::canonicalize(git_dir)
             .with_context(|| format!("Failed to resolve Git directory {}", git_dir.display()))?;
         let common_dir_file = git_dir.join("commondir");
@@ -64,6 +67,7 @@ impl GitWorktreeContext {
             // platform-specific prefixes such as /private on macOS and \\?\ on
             // Windows, preventing lexical worktree-relative path matching.
             root: root.to_owned(),
+            canonical_root,
             common_dir: fs::canonicalize(&common_dir).with_context(|| {
                 format!(
                     "Failed to resolve Git common directory {}",
@@ -81,8 +85,13 @@ impl GitWorktreeContext {
         &self.common_dir
     }
 
+    pub(crate) fn roots(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.root.as_path())
+            .chain((self.canonical_root != self.root).then_some(self.canonical_root.as_path()))
+    }
+
     pub(crate) fn relative_path<'a>(&self, path: &'a Path) -> Option<&'a Path> {
-        path.strip_prefix(&self.root).ok()
+        self.roots().find_map(|root| path.strip_prefix(root).ok())
     }
 }
 
@@ -162,6 +171,28 @@ mod tests {
 
         let context = GitWorktreeContext::discover(&root)?.expect("Git context");
         assert_eq!(context.common_dir(), fs::canonicalize(&git_dir)?);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn matches_paths_through_a_canonical_worktree_alias() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let canonical_root = temp.path().join("canonical/repository");
+        fs::create_dir_all(canonical_root.join(".git"))?;
+        let alias_parent = temp.path().join("alias");
+        symlink(temp.path().join("canonical"), &alias_parent)?;
+        let alias_root = alias_parent.join("repository");
+
+        let context = GitWorktreeContext::discover(&alias_root)?.expect("Git context");
+
+        assert_eq!(context.root(), alias_root);
+        assert_eq!(
+            context.relative_path(&canonical_root.join("src/lib.rs")),
+            Some(Path::new("src/lib.rs"))
+        );
         Ok(())
     }
 

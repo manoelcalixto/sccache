@@ -187,10 +187,11 @@ mod tests {
         let alias_root = alias_parent.join("repository");
 
         let context = GitWorktreeContext::discover(&alias_root)?.expect("Git context");
+        let resolved_root = fs::canonicalize(&canonical_root)?;
 
         assert_eq!(context.root(), alias_root);
         assert_eq!(
-            context.relative_path(&canonical_root.join("src/lib.rs")),
+            context.relative_path(&resolved_root.join("src/lib.rs")),
             Some(Path::new("src/lib.rs"))
         );
         Ok(())

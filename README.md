@@ -375,6 +375,7 @@ Known Caveats
 
 * Crates that invoke the system linker cannot be cached. This includes `bin`, `dylib`, `cdylib`, and `proc-macro` crates. You may be able to improve compilation time of large `bin` crates by converting them to a `lib` crate with a thin `bin` wrapper.
 * Incrementally compiled crates cannot be cached. By default, in the debug profile Cargo will use incremental compilation for workspace members and path dependencies. [You can disable incremental compilation.](https://doc.rust-lang.org/cargo/reference/profiles.html#incremental)
+* Rust cache entries can be shared safely between linked local Git worktrees by enabling `SCCACHE_GIT_WORKTREES=1` in the project's Cargo configuration. See [Sharing cache entries between Git worktrees](docs/Rust.md#sharing-cache-entries-between-git-worktrees).
 
 [More details on Rust caveats](/docs/Rust.md)
 

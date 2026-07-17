@@ -5,7 +5,7 @@
 
 pub mod helpers;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use helpers::{CARGO, CRATE_DIR, cargo_clean, stop_sccache};
 
 use assert_cmd::prelude::*;
@@ -13,8 +13,10 @@ use fs_err as fs;
 use helpers::{SCCACHE_BIN, SccacheTest};
 use predicates::prelude::*;
 use serial_test::serial;
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
+use walkdir::WalkDir;
 
 #[macro_use]
 extern crate log;
@@ -41,6 +43,183 @@ fn test_rust_cargo_build() -> Result<()> {
 #[serial]
 fn test_rust_cargo_build_readonly() -> Result<()> {
     test_rust_cargo_cmd_readonly("build", SccacheTest::new(None)?)
+}
+
+#[test]
+#[serial]
+fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
+    let git_worktrees = [("SCCACHE_GIT_WORKTREES", OsString::from("1"))];
+    let test_info = SccacheTest::new(Some(&git_worktrees))?;
+    let repository = test_info.tempdir.path().join("repository");
+    let linked = test_info.tempdir.path().join("linked");
+    copy_worktree_test_crate(&repository)?;
+    init_git_repository(&repository)?;
+    git(
+        &repository,
+        &["worktree", "add", "--detach", path_str(&linked)?],
+    )?;
+
+    build_worktree(&test_info, &repository, "1")?;
+    let hits_after_repository = rust_cache_stat("cache_hits")?;
+    build_worktree(&test_info, &linked, "1")?;
+    let hits_after_linked = rust_cache_stat("cache_hits")?;
+    ensure!(
+        hits_after_linked > hits_after_repository,
+        "expected a Rust cache hit in the linked worktree (before: {hits_after_repository}, after: {hits_after_linked})"
+    );
+    ensure_dep_info_uses_current_worktree(&repository, &linked)?;
+
+    clean_worktree(&test_info, &repository)?;
+    build_worktree(&test_info, &repository, path_str(&repository)?)?;
+    let misses_before_env_path = rust_cache_stat("cache_misses")?;
+    clean_worktree(&test_info, &linked)?;
+    build_worktree(&test_info, &linked, path_str(&linked)?)?;
+    ensure!(
+        rust_cache_stat("cache_misses")? > misses_before_env_path,
+        "a worktree-specific value used by env! must cause a cache miss"
+    );
+
+    let source = linked.join("src/lib.rs");
+    fs::write(
+        &source,
+        format!(
+            "{}\npub fn changed_in_worktree() {{}}\n",
+            fs::read_to_string(&source)?
+        ),
+    )?;
+    clean_worktree(&test_info, &linked)?;
+    let misses_before_source_change = rust_cache_stat("cache_misses")?;
+    build_worktree(&test_info, &linked, "1")?;
+    ensure!(
+        rust_cache_stat("cache_misses")? > misses_before_source_change,
+        "changed source must cause a cache miss"
+    );
+
+    let independent = test_info.tempdir.path().join("independent");
+    git(
+        test_info.tempdir.path(),
+        &[
+            "clone",
+            "--local",
+            path_str(&repository)?,
+            path_str(&independent)?,
+        ],
+    )?;
+    let hits_before_independent_clone = rust_cache_stat("cache_hits")?;
+    let misses_before_independent_clone = rust_cache_stat("cache_misses")?;
+    build_worktree(&test_info, &independent, "1")?;
+    ensure!(
+        rust_cache_stat("cache_misses")? > misses_before_independent_clone,
+        "an independent clone must not share the worktree cache namespace"
+    );
+    ensure!(
+        rust_cache_stat("cache_hits")? == hits_before_independent_clone,
+        "an independent clone unexpectedly reused a linked-worktree entry"
+    );
+    Ok(())
+}
+
+fn path_str(path: &Path) -> Result<&str> {
+    path.to_str()
+        .with_context(|| format!("Path is not UTF-8: {}", path.display()))
+}
+
+fn copy_worktree_test_crate(destination: &Path) -> Result<()> {
+    let fixture = CRATE_DIR
+        .parent()
+        .expect("test-crate parent")
+        .join("worktree-crate");
+    fs::create_dir_all(destination.join("src"))?;
+    for relative in ["Cargo.toml", "src/lib.rs"] {
+        fs::copy(fixture.join(relative), destination.join(relative))?;
+    }
+    Ok(())
+}
+
+fn git(cwd: &Path, arguments: &[&str]) -> Result<()> {
+    Command::new("git")
+        .args(arguments)
+        .current_dir(cwd)
+        .assert()
+        .try_success()
+        .with_context(|| format!("git {} failed", arguments.join(" ")))?;
+    Ok(())
+}
+
+fn init_git_repository(repository: &Path) -> Result<()> {
+    git(repository, &["init", "--initial-branch=main"])?;
+    git(repository, &["add", "."])?;
+    git(
+        repository,
+        &[
+            "-c",
+            "user.name=sccache tests",
+            "-c",
+            "user.email=sccache@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    )
+}
+
+fn build_worktree(test_info: &SccacheTest<'_>, root: &Path, env_value: &str) -> Result<()> {
+    Command::new(CARGO.as_os_str())
+        .args(["build", "--color=never"])
+        .envs(test_info.env.iter().cloned())
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .env("TEST_ENV_VAR", env_value)
+        .current_dir(root)
+        .assert()
+        .try_success()?;
+    Ok(())
+}
+
+fn clean_worktree(test_info: &SccacheTest<'_>, root: &Path) -> Result<()> {
+    Command::new(CARGO.as_os_str())
+        .arg("clean")
+        .envs(test_info.env.iter().cloned())
+        .env("CARGO_TARGET_DIR", root.join("target"))
+        .current_dir(root)
+        .assert()
+        .try_success()?;
+    Ok(())
+}
+
+fn rust_cache_stat(category: &str) -> Result<u64> {
+    let output = Command::new(SCCACHE_BIN.as_os_str())
+        .args(["--show-stats", "--stats-format=json"])
+        .output()?;
+    ensure!(output.status.success(), "sccache --show-stats failed");
+    let stats: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    Ok(stats["stats"][category]["counts"]["Rust"]
+        .as_u64()
+        .unwrap_or(0))
+}
+
+fn ensure_dep_info_uses_current_worktree(repository: &Path, linked: &Path) -> Result<()> {
+    let repository = path_str(repository)?;
+    let mut dep_info_files = 0;
+    for entry in WalkDir::new(linked.join("target")) {
+        let entry = entry?;
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("d")
+        {
+            continue;
+        }
+        dep_info_files += 1;
+        let contents = fs::read_to_string(entry.path())?;
+        ensure!(
+            !contents.contains(repository),
+            "{} still references the original worktree",
+            entry.path().display()
+        );
+    }
+    ensure!(dep_info_files > 0, "no dep-info files were generated");
+    Ok(())
 }
 
 #[test]

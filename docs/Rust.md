@@ -37,6 +37,7 @@ This mode is intentionally local:
 * Paths outside the worktree remain absolute cache-key inputs. Using the default `target` directory (or the same target path relative to every worktree root) gives the best results.
 * Source dependencies passed to rustc as absolute paths remain worktree-specific because rustc preserves those paths in dep-info files. Cargo normally passes project sources as relative paths.
 * Values actually read through `env!` are not normalized. A worktree-specific absolute value therefore causes a safe cache miss.
+* Crates that load proc macros keep `CARGO_*` environment paths worktree-specific because proc macros can observe those values without rustc reporting an env-dep.
 * User-provided `--remap-path-prefix` rules take precedence over sccache's worktree rule. Because their effective matches can differ between worktrees, compilations that use them remain worktree-specific.
 
 The automatic remap can make paths embedded by `file!`, debug information, diagnostics, and similar compiler output relative instead of absolute. Run `cargo clean` once after enabling or disabling this mode so Cargo does not reuse artifacts produced with the other path convention.

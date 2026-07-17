@@ -133,6 +133,20 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
         "a user path remap unexpectedly reused another worktree's entry"
     );
 
+    let proc_macro = build_env_proc_macro(&test_info)?;
+    compile_proc_macro_consumer(&test_info, &repository, &proc_macro)?;
+    let hits_before_proc_macro_linked = rust_cache_stat("cache_hits")?;
+    let misses_before_proc_macro_linked = rust_cache_stat("cache_misses")?;
+    compile_proc_macro_consumer(&test_info, &linked, &proc_macro)?;
+    ensure!(
+        rust_cache_stat("cache_misses")? > misses_before_proc_macro_linked,
+        "a proc macro that can observe Cargo env paths must cause a worktree-specific miss"
+    );
+    ensure!(
+        rust_cache_stat("cache_hits")? == hits_before_proc_macro_linked,
+        "a proc macro unexpectedly reused another worktree's Cargo env entry"
+    );
+
     clean_worktree(&test_info, &repository)?;
     build_worktree(&test_info, &repository, path_str(&repository)?)?;
     let misses_before_env_path = rust_cache_stat("cache_misses")?;
@@ -194,7 +208,7 @@ fn copy_worktree_test_crate(destination: &Path) -> Result<()> {
         .expect("test-crate parent")
         .join("worktree-crate");
     fs::create_dir_all(destination.join("src"))?;
-    for relative in ["Cargo.toml", "src/lib.rs"] {
+    for relative in ["Cargo.toml", "src/lib.rs", "src/proc_macro_consumer.rs"] {
         fs::copy(fixture.join(relative), destination.join(relative))?;
     }
     Ok(())
@@ -294,6 +308,74 @@ fn ensure_dep_info_targets_are_relative(dep_info: &Path) -> Result<()> {
         "{} contains the unexpected target {target}",
         dep_info.display()
     );
+    Ok(())
+}
+
+fn build_env_proc_macro(test_info: &SccacheTest<'_>) -> Result<std::path::PathBuf> {
+    let source = test_info.tempdir.path().join("env_proc_macro.rs");
+    let output_dir = test_info.tempdir.path().join("proc-macro-target");
+    fs::create_dir_all(&output_dir)?;
+    fs::write(
+        &source,
+        r#"extern crate proc_macro;
+use proc_macro::TokenStream;
+
+#[proc_macro]
+pub fn cargo_manifest_dir(_input: TokenStream) -> TokenStream {
+    format!("{:?}", std::env::var("CARGO_MANIFEST_DIR").unwrap())
+        .parse()
+        .unwrap()
+}
+"#,
+    )?;
+    Command::new("rustc")
+        .args([
+            "--crate-name",
+            "env_proc_macro",
+            "--crate-type",
+            "proc-macro",
+        ])
+        .arg(&source)
+        .arg("--out-dir")
+        .arg(&output_dir)
+        .assert()
+        .try_success()?;
+    Ok(output_dir.join(format!(
+        "{}env_proc_macro.{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_EXTENSION
+    )))
+}
+
+fn compile_proc_macro_consumer(
+    test_info: &SccacheTest<'_>,
+    root: &Path,
+    proc_macro: &Path,
+) -> Result<()> {
+    let output_dir = Path::new("proc-macro-consumer-target");
+    fs::create_dir_all(root.join(output_dir))?;
+    let mut extern_arg = OsString::from("env_proc_macro=");
+    extern_arg.push(proc_macro);
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("rustc")
+        .args([
+            "--crate-name",
+            "proc_macro_consumer",
+            "--crate-type",
+            "lib",
+            "--emit=link,dep-info",
+            "--color=never",
+            "--out-dir",
+        ])
+        .arg(output_dir)
+        .arg("--extern")
+        .arg(extern_arg)
+        .arg("src/proc_macro_consumer.rs")
+        .envs(test_info.env.iter().cloned())
+        .env("CARGO_MANIFEST_DIR", root)
+        .current_dir(root)
+        .assert()
+        .try_success()?;
     Ok(())
 }
 

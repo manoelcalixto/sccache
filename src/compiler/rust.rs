@@ -344,6 +344,13 @@ fn has_user_path_remap(arguments: &[Argument<ArgData>]) -> bool {
         .any(|argument| argument.flag_str() == Some("--remap-path-prefix"))
 }
 
+fn may_load_proc_macro(externs: &[PathBuf]) -> bool {
+    externs.iter().any(|path| {
+        path.extension()
+            .is_some_and(|extension| extension == DLL_EXTENSION)
+    })
+}
+
 fn include_object_remap_scope(argument: Argument<ArgData>) -> Argument<ArgData> {
     match argument {
         Argument::WithValue(
@@ -1817,6 +1824,7 @@ where
             .iter()
             .map(|(name, _)| name.clone())
             .collect::<HashSet<_>>();
+        let may_load_proc_macro = may_load_proc_macro(&abs_externs);
         let mut env_vars: Vec<_> = env_vars
             .iter()
             // Filter out RUSTC_COLOR since we control color usage with command line flags.
@@ -1847,7 +1855,7 @@ where
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
             if let Some(relative) = git_worktree.as_ref().and_then(|context| {
-                (!env_dep_names.contains(var))
+                (!may_load_proc_macro && !env_dep_names.contains(var))
                     .then(|| worktree_relative_path(Path::new(val), context))
                     .flatten()
             }) {
@@ -3119,6 +3127,14 @@ LLVM version: 15.0.2
 
         assert!(has_user_path_remap(&arguments));
         assert!(!has_user_path_remap(&[]));
+    }
+
+    #[test]
+    fn dynamic_externs_may_be_proc_macros() {
+        let dynamic = PathBuf::from(format!("libderive.{DLL_EXTENSION}"));
+
+        assert!(may_load_proc_macro(&[dynamic]));
+        assert!(!may_load_proc_macro(&["libdependency.rlib".into()]));
     }
 
     #[test]

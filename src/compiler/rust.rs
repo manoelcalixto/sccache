@@ -338,6 +338,12 @@ fn normalize_worktree_argument(
     (argument_string, value)
 }
 
+fn has_user_path_remap(arguments: &[Argument<ArgData>]) -> bool {
+    arguments
+        .iter()
+        .any(|argument| argument.flag_str() == Some("--remap-path-prefix"))
+}
+
 fn include_object_remap_scope(argument: Argument<ArgData>) -> Argument<ArgData> {
     match argument {
         Argument::WithValue(
@@ -1733,6 +1739,12 @@ where
                 m.update(b"absolute-worktree-source");
                 context.root().hash(&mut HashToDigest { digest: &mut m });
             }
+            if has_user_path_remap(&self.parsed_args.arguments) {
+                // User remaps take precedence over sccache's injected remap and may
+                // match paths in one worktree but not another. Keep these entries local.
+                m.update(b"user-path-remap");
+                context.root().hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
@@ -2166,14 +2178,23 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         Ok((CCompileCommand::new(command), dist_command, Cacheable::Yes))
     }
 
-    fn handle_cache_hit(&self, outputs: &[FileObjectSource]) -> Result<()> {
+    fn handle_cache_hit(&self, _outputs: &[FileObjectSource]) -> Result<()> {
         if !self.git_worktrees {
             return Ok(());
         }
         let Some(dep_info) = &self.dep_info else {
             return Ok(());
         };
-        rewrite_cached_dep_info_targets(&self.cwd.join(dep_info), outputs)
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|(key, descriptor)| FileObjectSource {
+                key: key.clone(),
+                path: descriptor.path.clone(),
+                optional: descriptor.optional,
+            })
+            .collect::<Vec<_>>();
+        rewrite_cached_dep_info_targets(&self.cwd.join(dep_info), &outputs)
     }
 
     #[cfg(feature = "dist-client")]
@@ -3089,6 +3110,18 @@ LLVM version: 15.0.2
     }
 
     #[test]
+    fn user_path_remaps_are_detected() {
+        let arguments = vec![Argument::WithValue(
+            "--remap-path-prefix",
+            ArgData::PassThrough("/workspace=redacted".into()),
+            ArgDisposition::Separated,
+        )];
+
+        assert!(has_user_path_remap(&arguments));
+        assert!(!has_user_path_remap(&[]));
+    }
+
+    #[test]
     fn cached_dep_info_targets_are_rewritten_for_current_worktree() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let dep_info = temp.path().join("target/current/example.d");
@@ -3121,6 +3154,41 @@ LLVM version: 15.0.2
             escape_makefile_path(&dep_info)
         );
         assert_eq!(fs::read_to_string(dep_info)?, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_dep_info_targets_preserve_relative_outputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dep_info = temp.path().join("target/current/example.d");
+        fs::create_dir_all(dep_info.parent().expect("dep-info parent"))?;
+        fs::write(
+            &dep_info,
+            "target/old/libexample.rlib: ./src/lib.rs\n\
+target/old/example.d: ./src/lib.rs\n\
+./src/lib.rs:\n",
+        )?;
+        let outputs = vec![
+            FileObjectSource {
+                key: "libexample.rlib".into(),
+                path: "target/current/libexample.rlib".into(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "example.d".into(),
+                path: "target/current/example.d".into(),
+                optional: false,
+            },
+        ];
+
+        rewrite_cached_dep_info_targets(&dep_info, &outputs)?;
+
+        assert_eq!(
+            fs::read_to_string(dep_info)?,
+            "target/current/libexample.rlib: ./src/lib.rs\n\
+target/current/example.d: ./src/lib.rs\n\
+./src/lib.rs:\n"
+        );
         Ok(())
     }
 

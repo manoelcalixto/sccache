@@ -69,6 +69,29 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
     );
     ensure_dep_info_uses_current_worktree(&repository, &linked)?;
 
+    compile_direct_input(
+        &test_info,
+        &repository,
+        "relative_input",
+        Path::new("src/lib.rs"),
+        Path::new("relative-target"),
+        None,
+    )?;
+    let hits_before_relative_linked = rust_cache_stat("cache_hits")?;
+    compile_direct_input(
+        &test_info,
+        &linked,
+        "relative_input",
+        Path::new("src/lib.rs"),
+        Path::new("relative-target"),
+        None,
+    )?;
+    ensure!(
+        rust_cache_stat("cache_hits")? > hits_before_relative_linked,
+        "relative direct rustc paths should share an entry across worktrees"
+    );
+    ensure_dep_info_targets_are_relative(&linked.join("relative-target/relative_input.d"))?;
+
     compile_absolute_input(&test_info, &repository)?;
     let hits_before_absolute_linked = rust_cache_stat("cache_hits")?;
     let misses_before_absolute_linked = rust_cache_stat("cache_misses")?;
@@ -80,6 +103,34 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
     ensure!(
         rust_cache_stat("cache_hits")? == hits_before_absolute_linked,
         "an absolute source input unexpectedly reused another worktree's entry"
+    );
+
+    let user_remap = format!("{}=redacted", path_str(&repository)?);
+    compile_direct_input(
+        &test_info,
+        &repository,
+        "user_remap",
+        Path::new("src/lib.rs"),
+        Path::new("user-remap-target"),
+        Some(&user_remap),
+    )?;
+    let hits_before_user_remap_linked = rust_cache_stat("cache_hits")?;
+    let misses_before_user_remap_linked = rust_cache_stat("cache_misses")?;
+    compile_direct_input(
+        &test_info,
+        &linked,
+        "user_remap",
+        Path::new("src/lib.rs"),
+        Path::new("user-remap-target"),
+        Some(&user_remap),
+    )?;
+    ensure!(
+        rust_cache_stat("cache_misses")? > misses_before_user_remap_linked,
+        "a user path remap must not share an entry across worktrees"
+    );
+    ensure!(
+        rust_cache_stat("cache_hits")? == hits_before_user_remap_linked,
+        "a user path remap unexpectedly reused another worktree's entry"
     );
 
     clean_worktree(&test_info, &repository)?;
@@ -189,25 +240,60 @@ fn build_worktree(test_info: &SccacheTest<'_>, root: &Path, env_value: &str) -> 
 }
 
 fn compile_absolute_input(test_info: &SccacheTest<'_>, root: &Path) -> Result<()> {
-    let output_dir = root.join("absolute-target");
-    fs::create_dir_all(&output_dir)?;
-    Command::new(SCCACHE_BIN.as_os_str())
+    compile_direct_input(
+        test_info,
+        root,
+        "absolute_input",
+        &root.join("src/lib.rs"),
+        Path::new("absolute-target"),
+        None,
+    )
+}
+
+fn compile_direct_input(
+    test_info: &SccacheTest<'_>,
+    root: &Path,
+    crate_name: &str,
+    source: &Path,
+    output_dir: &Path,
+    user_remap: Option<&str>,
+) -> Result<()> {
+    fs::create_dir_all(root.join(output_dir))?;
+    let mut command = Command::new(SCCACHE_BIN.as_os_str());
+    command
         .arg("rustc")
-        .args([
-            "--crate-name",
-            "absolute_input",
-            "--crate-type",
-            "lib",
-            "--emit=link,dep-info",
-            "--color=never",
-        ])
+        .args(["--crate-name", crate_name, "--crate-type", "lib"])
+        .args(["--emit=link,dep-info", "--color=never"])
         .arg("--out-dir")
-        .arg(&output_dir)
-        .arg(root.join("src/lib.rs"))
+        .arg(output_dir);
+    if let Some(remap) = user_remap {
+        command.arg("--remap-path-prefix").arg(remap);
+    }
+    command
+        .arg(source)
         .envs(test_info.env.iter().cloned())
         .current_dir(root)
         .assert()
         .try_success()?;
+    Ok(())
+}
+
+fn ensure_dep_info_targets_are_relative(dep_info: &Path) -> Result<()> {
+    let contents = fs::read_to_string(dep_info)?;
+    let target = contents
+        .lines()
+        .find_map(|line| line.split_once(": ").map(|(target, _)| target))
+        .context("dep-info did not contain a target with dependencies")?;
+    ensure!(
+        !Path::new(target).is_absolute(),
+        "{} contains an absolute target {target}",
+        dep_info.display()
+    );
+    ensure!(
+        target.starts_with("relative-target"),
+        "{} contains the unexpected target {target}",
+        dep_info.display()
+    );
     Ok(())
 }
 

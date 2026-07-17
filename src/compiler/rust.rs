@@ -3211,8 +3211,10 @@ C:\\old\\worktree\\target\\example.d: src\\lib.rs\n",
         rewrite_cached_dep_info_targets(&dep_info, &outputs)?;
 
         let contents = fs::read_to_string(&dep_info)?;
-        assert!(contents.contains(output.to_string_lossy().as_ref()));
-        assert!(contents.contains(dep_info.to_string_lossy().as_ref()));
+        let output = output.to_string_lossy();
+        let dep_info = dep_info.to_string_lossy();
+        assert!(contents.contains(&*output));
+        assert!(contents.contains(&*dep_info));
         assert!(!contents.contains("C:\\old\\worktree"));
         Ok(())
     }

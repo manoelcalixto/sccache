@@ -5,6 +5,7 @@
 [![dependency status](https://deps.rs/repo/github/mozilla/sccache/status.svg)](https://deps.rs/repo/github/mozilla/sccache)
 
 [![CodeCov](https://codecov.io/gh/mozilla/sccache/branch/main/graph/badge.svg)](https://codecov.io/gh/mozilla/sccache)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/manoelcalixto/sccache?utm_source=badge)
 
 
 sccache - Shared Compilation Cache

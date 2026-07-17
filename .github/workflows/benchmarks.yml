@@ -7,9 +7,13 @@ on:
   push:
     branches:
       - '*'
+  # `workflow_dispatch` allows CodSpeed to trigger backtest
+  # performance analysis in order to generate initial data.
+  workflow_dispatch:
 
 permissions:
   contents: read # to fetch code (actions/checkout)
+  id-token: write # for OpenID Connect authentication with CodSpeed
 
 # End the current execution if there is a new changeset in the PR.
 concurrency:
@@ -44,9 +48,6 @@ jobs:
 
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v4
-        env:
-          CODSPEED_LOG: debug
         with:
           mode: ${{ matrix.mode }}
           run: cargo codspeed run > /dev/null
-          token: ${{ secrets.CODSPEED_TOKEN }}

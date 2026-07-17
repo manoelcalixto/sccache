@@ -338,10 +338,13 @@ fn normalize_worktree_argument(
     (argument_string, value)
 }
 
-fn has_user_path_remap(arguments: &[Argument<ArgData>]) -> bool {
-    arguments
-        .iter()
-        .any(|argument| argument.flag_str() == Some("--remap-path-prefix"))
+fn has_user_path_remap_options(arguments: &[Argument<ArgData>]) -> bool {
+    arguments.iter().any(|argument| {
+        matches!(
+            argument.flag_str(),
+            Some("--remap-path-prefix" | "--remap-path-scope")
+        )
+    })
 }
 
 fn may_load_proc_macro(externs: &[PathBuf]) -> bool {
@@ -349,26 +352,6 @@ fn may_load_proc_macro(externs: &[PathBuf]) -> bool {
         path.extension()
             .is_some_and(|extension| extension == DLL_EXTENSION)
     })
-}
-
-fn include_object_remap_scope(argument: Argument<ArgData>) -> Argument<ArgData> {
-    match argument {
-        Argument::WithValue(
-            flag @ "--remap-path-scope",
-            ArgData::PassThrough(mut scopes),
-            disposition,
-        ) => {
-            if !scopes
-                .to_string_lossy()
-                .split(',')
-                .any(|scope| matches!(scope.trim(), "object" | "all"))
-            {
-                scopes.push(",object");
-            }
-            Argument::WithValue(flag, ArgData::PassThrough(scopes), disposition)
-        }
-        argument => argument,
-    }
 }
 
 fn rust_arguments_for_worktree(
@@ -387,7 +370,7 @@ fn rust_arguments_for_worktree(
         ArgData::PassThrough(remap),
         ArgDisposition::Separated,
     ));
-    result.extend(arguments.iter().cloned().map(include_object_remap_scope));
+    result.extend(arguments.iter().cloned());
     result
 }
 
@@ -1746,10 +1729,10 @@ where
                 m.update(b"absolute-worktree-source");
                 context.root().hash(&mut HashToDigest { digest: &mut m });
             }
-            if has_user_path_remap(&self.parsed_args.arguments) {
-                // User remaps take precedence over sccache's injected remap and may
-                // match paths in one worktree but not another. Keep these entries local.
-                m.update(b"user-path-remap");
+            if has_user_path_remap_options(&self.parsed_args.arguments) {
+                // User remap prefixes and scopes take precedence over sccache's injected
+                // remap and may produce different objects. Keep these entries local.
+                m.update(b"user-path-remap-options");
                 context.root().hash(&mut HashToDigest { digest: &mut m });
             }
         }
@@ -3098,7 +3081,7 @@ LLVM version: 15.0.2
     }
 
     #[test]
-    fn worktree_remap_merges_object_into_existing_scope() -> Result<()> {
+    fn worktree_remap_preserves_existing_scope() -> Result<()> {
         let temp = tempfile::tempdir()?;
         fs::create_dir(temp.path().join(".git"))?;
         let context = GitWorktreeContext::discover(temp.path())?.expect("Git context");
@@ -3107,12 +3090,6 @@ LLVM version: 15.0.2
             ArgData::PassThrough("macro".into()),
             ArgDisposition::Separated,
         );
-        let expected = Argument::WithValue(
-            "--remap-path-scope",
-            ArgData::PassThrough("macro,object".into()),
-            ArgDisposition::Separated,
-        );
-
         let arguments =
             rust_arguments_for_worktree(std::slice::from_ref(&user_scope), Some(&context));
         let scopes = arguments
@@ -3120,20 +3097,26 @@ LLVM version: 15.0.2
             .filter(|argument| argument.flag_str() == Some("--remap-path-scope"))
             .collect::<Vec<_>>();
 
-        assert_eq!(scopes, vec![&expected]);
+        assert_eq!(scopes, vec![&user_scope]);
         Ok(())
     }
 
     #[test]
-    fn user_path_remaps_are_detected() {
-        let arguments = vec![Argument::WithValue(
+    fn user_path_remap_options_are_detected() {
+        let prefix = Argument::WithValue(
             "--remap-path-prefix",
             ArgData::PassThrough("/workspace=redacted".into()),
             ArgDisposition::Separated,
-        )];
+        );
+        let scope = Argument::WithValue(
+            "--remap-path-scope",
+            ArgData::PassThrough("macro".into()),
+            ArgDisposition::Separated,
+        );
 
-        assert!(has_user_path_remap(&arguments));
-        assert!(!has_user_path_remap(&[]));
+        assert!(has_user_path_remap_options(&[prefix]));
+        assert!(has_user_path_remap_options(&[scope]));
+        assert!(!has_user_path_remap_options(&[]));
     }
 
     #[test]

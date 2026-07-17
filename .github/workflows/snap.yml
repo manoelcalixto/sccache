@@ -26,5 +26,5 @@ jobs:
         snapcraft-channel: edge
         review-opts: --allow-classic
         snapcraft-token: ${{ secrets.SNAPCRAFT_TOKEN }}
-        publish: ${{ github.event_name == 'pull_request' && github.repository == github.event.pull_request.head.repo.full_name }}
+        publish: ${{ github.repository == 'mozilla/sccache' && github.event_name == 'pull_request' && github.repository == github.event.pull_request.head.repo.full_name }}
         publish-channel: edge/pr${{ github.event.number }}

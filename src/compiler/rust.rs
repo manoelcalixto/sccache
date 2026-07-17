@@ -338,6 +338,26 @@ fn normalize_worktree_argument(
     (argument_string, value)
 }
 
+fn include_object_remap_scope(argument: Argument<ArgData>) -> Argument<ArgData> {
+    match argument {
+        Argument::WithValue(
+            flag @ "--remap-path-scope",
+            ArgData::PassThrough(mut scopes),
+            disposition,
+        ) => {
+            if !scopes
+                .to_string_lossy()
+                .split(',')
+                .any(|scope| matches!(scope.trim(), "object" | "all"))
+            {
+                scopes.push(",object");
+            }
+            Argument::WithValue(flag, ArgData::PassThrough(scopes), disposition)
+        }
+        argument => argument,
+    }
+}
+
 fn rust_arguments_for_worktree(
     arguments: &[Argument<ArgData>],
     context: Option<&GitWorktreeContext>,
@@ -348,23 +368,13 @@ fn rust_arguments_for_worktree(
 
     let mut remap = context.root().as_os_str().to_owned();
     remap.push("=.");
-    let mut result = Vec::with_capacity(arguments.len() + 2);
+    let mut result = Vec::with_capacity(arguments.len() + 1);
     result.push(Argument::WithValue(
         "--remap-path-prefix",
         ArgData::PassThrough(remap),
         ArgDisposition::Separated,
     ));
-    if arguments
-        .iter()
-        .any(|argument| argument.flag_str() == Some("--remap-path-scope"))
-    {
-        result.push(Argument::WithValue(
-            "--remap-path-scope",
-            ArgData::PassThrough("object".into()),
-            ArgDisposition::Separated,
-        ));
-    }
-    result.extend_from_slice(arguments);
+    result.extend(arguments.iter().cloned().map(include_object_remap_scope));
     result
 }
 
@@ -3010,6 +3020,33 @@ LLVM version: 15.0.2
             rust_arguments_for_worktree(std::slice::from_ref(&user_remap), Some(&context));
 
         assert_eq!(arguments.last(), Some(&user_remap));
+        Ok(())
+    }
+
+    #[test]
+    fn worktree_remap_merges_object_into_existing_scope() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir(temp.path().join(".git"))?;
+        let context = GitWorktreeContext::discover(temp.path())?.expect("Git context");
+        let user_scope = Argument::WithValue(
+            "--remap-path-scope",
+            ArgData::PassThrough("macro".into()),
+            ArgDisposition::Separated,
+        );
+        let expected = Argument::WithValue(
+            "--remap-path-scope",
+            ArgData::PassThrough("macro,object".into()),
+            ArgDisposition::Separated,
+        );
+
+        let arguments =
+            rust_arguments_for_worktree(std::slice::from_ref(&user_scope), Some(&context));
+        let scopes = arguments
+            .iter()
+            .filter(|argument| argument.flag_str() == Some("--remap-path-scope"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(scopes, vec![&expected]);
         Ok(())
     }
 

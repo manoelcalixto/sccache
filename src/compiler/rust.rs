@@ -292,6 +292,11 @@ fn discover_git_worktree(
 fn worktree_relative_path(path: &Path, context: &GitWorktreeContext) -> Option<PathBuf> {
     let relative = context
         .relative_path(path)
+        .filter(|relative| {
+            !relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        })
         .map(Path::to_owned)
         .or_else(|| {
             if !path.is_absolute() {
@@ -3044,6 +3049,27 @@ LLVM version: 15.0.2
         let env = vec![(GIT_WORKTREES_ENV.into(), "sometimes".into())];
 
         assert!(!git_worktrees_enabled(&env));
+    }
+
+    #[test]
+    fn worktree_relative_paths_cannot_escape_through_parent_components() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repository");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::create_dir(root.join("src"))?;
+        fs::write(root.join("inside.rs"), "inside")?;
+        fs::write(temp.path().join("outside.rs"), "outside")?;
+        let context = GitWorktreeContext::discover(&root)?.expect("Git context");
+
+        assert_eq!(
+            worktree_relative_path(&root.join("src/../inside.rs"), &context),
+            Some(PathBuf::from("inside.rs"))
+        );
+        assert_eq!(
+            worktree_relative_path(&root.join("../outside.rs"), &context),
+            None
+        );
+        Ok(())
     }
 
     #[test]

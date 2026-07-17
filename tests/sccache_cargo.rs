@@ -140,7 +140,7 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
     compile_proc_macro_consumer(&test_info, &linked, &proc_macro)?;
     ensure!(
         rust_cache_stat("cache_misses")? > misses_before_proc_macro_linked,
-        "a proc macro that can observe Cargo env paths must cause a worktree-specific miss"
+        "a proc macro that can observe OUT_DIR must cause a worktree-specific miss"
     );
     ensure!(
         rust_cache_stat("cache_hits")? == hits_before_proc_macro_linked,
@@ -321,8 +321,8 @@ fn build_env_proc_macro(test_info: &SccacheTest<'_>) -> Result<std::path::PathBu
 use proc_macro::TokenStream;
 
 #[proc_macro]
-pub fn cargo_manifest_dir(_input: TokenStream) -> TokenStream {
-    format!("{:?}", std::env::var("CARGO_MANIFEST_DIR").unwrap())
+pub fn observed_out_dir(_input: TokenStream) -> TokenStream {
+    format!("{:?}", std::env::var("OUT_DIR").unwrap())
         .parse()
         .unwrap()
 }
@@ -372,7 +372,7 @@ fn compile_proc_macro_consumer(
         .arg(extern_arg)
         .arg("src/proc_macro_consumer.rs")
         .envs(test_info.env.iter().cloned())
-        .env("CARGO_MANIFEST_DIR", root)
+        .env("OUT_DIR", root.join("generated"))
         .current_dir(root)
         .assert()
         .try_success()?;

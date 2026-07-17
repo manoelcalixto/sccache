@@ -1703,6 +1703,7 @@ where
             absolute_source_files,
             mut env_deps,
         } = dep_info;
+        let may_load_proc_macro = may_load_proc_macro(&abs_externs);
 
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
@@ -1733,6 +1734,12 @@ where
                 // User remap prefixes and scopes take precedence over sccache's injected
                 // remap and may produce different objects. Keep these entries local.
                 m.update(b"user-path-remap-options");
+                context.root().hash(&mut HashToDigest { digest: &mut m });
+            }
+            if may_load_proc_macro {
+                // Proc macros can observe arbitrary environment variables without
+                // rustc reporting env-deps, including worktree-specific paths.
+                m.update(b"proc-macro-worktree");
                 context.root().hash(&mut HashToDigest { digest: &mut m });
             }
         }
@@ -1807,7 +1814,6 @@ where
             .iter()
             .map(|(name, _)| name.clone())
             .collect::<HashSet<_>>();
-        let may_load_proc_macro = may_load_proc_macro(&abs_externs);
         let mut env_vars: Vec<_> = env_vars
             .iter()
             // Filter out RUSTC_COLOR since we control color usage with command line flags.

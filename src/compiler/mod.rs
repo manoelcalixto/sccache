@@ -23,6 +23,7 @@ mod compiler;
 mod cudafe;
 mod diab;
 mod gcc;
+mod git;
 mod msvc;
 mod nvcc;
 mod nvhpc;

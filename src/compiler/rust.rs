@@ -14,6 +14,7 @@
 
 use crate::cache::{FileObjectSource, Storage};
 use crate::compiler::args::*;
+use crate::compiler::git::GitWorktreeContext;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
     CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
@@ -221,6 +222,8 @@ pub struct RustCompilation {
     cwd: PathBuf,
     /// The environment variables
     env_vars: Vec<(OsString, OsString)>,
+    /// Whether cached dep-info targets need to be adjusted for this worktree.
+    git_worktrees: bool,
 }
 
 // The selection of crate types for this compilation
@@ -237,6 +240,324 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
 /// Version number for cache key.
 const CACHE_VERSION: &[u8] = b"6";
 
+const GIT_WORKTREES_ENV: &str = "SCCACHE_GIT_WORKTREES";
+const GIT_WORKTREES_CACHE_NAMESPACE: &[u8] = b"git-worktrees-v1";
+
+fn git_worktrees_enabled(env_vars: &[(OsString, OsString)]) -> bool {
+    let Some((_, value)) = env_vars
+        .iter()
+        .rev()
+        .find(|(name, _)| name == GIT_WORKTREES_ENV)
+    else {
+        return false;
+    };
+
+    match value.to_string_lossy().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "" | "0" | "false" | "no" | "off" => false,
+        value => {
+            warn!("Ignoring invalid {GIT_WORKTREES_ENV} value {value:?}");
+            false
+        }
+    }
+}
+
+fn discover_git_worktree(
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+) -> Option<GitWorktreeContext> {
+    if !git_worktrees_enabled(env_vars) {
+        return None;
+    }
+
+    match GitWorktreeContext::discover(cwd) {
+        Ok(Some(context)) => Some(context),
+        Ok(None) => {
+            debug!(
+                "{GIT_WORKTREES_ENV} is enabled, but {} is not in a Git worktree",
+                cwd.display()
+            );
+            None
+        }
+        Err(error) => {
+            warn!(
+                "Could not discover Git worktree for {}: {error:#}",
+                cwd.display()
+            );
+            None
+        }
+    }
+}
+
+fn worktree_relative_path(path: &Path, context: &GitWorktreeContext) -> Option<PathBuf> {
+    let lexical_relative = context.relative_path(path)?;
+    let relative = if lexical_relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        let canonical = fs::canonicalize(path).ok()?;
+        context.relative_path(&canonical)?.to_owned()
+    } else {
+        lexical_relative.to_owned()
+    };
+    Some(if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
+    })
+}
+
+fn worktree_relative_cargo_env_path(path: &Path, context: &GitWorktreeContext) -> Option<PathBuf> {
+    if let Some(relative) = worktree_relative_path(path, context) {
+        return Some(relative);
+    }
+    if !path.is_absolute() {
+        return None;
+    }
+
+    // The process cwd may resolve a whole-worktree symlink while Cargo keeps
+    // spelling CARGO_* paths through it. Only accept that alternate spelling
+    // after proving that it discovers the same Git metadata. A standalone
+    // symlink to a file inside the worktree has no such Git root.
+    let alias_context = GitWorktreeContext::discover(path).ok().flatten()?;
+    if alias_context.common_dir() != context.common_dir() {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    let relative = context.relative_path(&canonical)?.to_owned();
+    Some(if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
+    })
+}
+
+fn hash_worktree_path(m: &mut Digest, path: &Path, context: &GitWorktreeContext) {
+    if let Some(relative) = worktree_relative_path(path, context) {
+        m.update(b"worktree-relative-path");
+        relative.hash(&mut HashToDigest { digest: m });
+    } else {
+        m.update(b"absolute-path");
+        path.hash(&mut HashToDigest { digest: m });
+    }
+}
+
+fn hash_worktree_files(
+    m: &mut Digest,
+    paths: &[PathBuf],
+    hashes: impl IntoIterator<Item = String>,
+    context: &GitWorktreeContext,
+) {
+    for (path, hash) in paths.iter().zip(hashes) {
+        hash_worktree_path(m, path, context);
+        m.update(hash.as_bytes());
+    }
+}
+
+fn normalize_worktree_argument(
+    argument: &Argument<ArgData>,
+    context: &GitWorktreeContext,
+) -> (OsString, Option<OsString>) {
+    let argument_string = match argument {
+        Argument::Raw(value) => worktree_relative_path(Path::new(value), context)
+            .map(PathBuf::into_os_string)
+            .unwrap_or_else(|| value.clone()),
+        _ => argument.to_os_string(),
+    };
+    let value = argument
+        .get_data()
+        .cloned()
+        .map(IntoArg::into_arg_os_string);
+    (argument_string, value)
+}
+
+fn has_user_path_remap_options(arguments: &[Argument<ArgData>]) -> bool {
+    arguments.iter().any(|argument| {
+        matches!(
+            argument.flag_str(),
+            Some("--remap-path-prefix" | "--remap-path-scope")
+        )
+    })
+}
+
+fn is_dynamic_extern(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == DLL_EXTENSION)
+}
+
+fn is_metadata_extern(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "rlib" || extension == "rmeta")
+}
+
+#[cfg(not(feature = "dist-client"))]
+fn may_load_proc_macro(externs: &[PathBuf], _crate_link_paths: &[PathBuf]) -> bool {
+    externs
+        .iter()
+        .any(|path| is_dynamic_extern(path) || is_metadata_extern(path))
+}
+
+#[cfg(feature = "dist-client")]
+fn dynamic_crate_names(crate_link_paths: &[PathBuf]) -> Result<HashSet<String>> {
+    let mut names = HashSet::new();
+    for directory in crate_link_paths {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to inspect Rust crate link path {}",
+                        directory.display()
+                    )
+                });
+            }
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if !is_dynamic_extern(&path) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let stem = stem.strip_prefix(DLL_PREFIX).unwrap_or(stem);
+            let crate_name = stem.rsplit_once('-').map_or(stem, |(name, _)| name);
+            names.insert(crate_name.to_owned());
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(feature = "dist-client")]
+fn may_load_proc_macro(
+    externs: &[PathBuf],
+    crate_link_paths: &[PathBuf],
+    rlib_dep_reader: Option<&RlibDepReader>,
+    env_vars: &[(OsString, OsString)],
+) -> bool {
+    if externs.iter().any(|path| is_dynamic_extern(path)) {
+        return true;
+    }
+    let metadata_externs = externs
+        .iter()
+        .filter(|path| is_metadata_extern(path))
+        .collect::<Vec<_>>();
+    if metadata_externs.is_empty() {
+        return false;
+    }
+    let Some(rlib_dep_reader) = rlib_dep_reader else {
+        warn!(
+            "Keeping Rust metadata externs worktree-specific because metadata inspection is unavailable"
+        );
+        return true;
+    };
+    let dynamic_crate_names = match dynamic_crate_names(crate_link_paths) {
+        Ok(names) => names,
+        Err(error) => {
+            warn!("Keeping Rust metadata externs worktree-specific: {error:#}");
+            return true;
+        }
+    };
+    if dynamic_crate_names.is_empty() {
+        return false;
+    }
+
+    for metadata in metadata_externs {
+        match rlib_dep_reader.discover_rlib_deps(env_vars, metadata) {
+            Ok(dependencies) => {
+                if dependencies
+                    .iter()
+                    .any(|dependency| dynamic_crate_names.contains(dependency))
+                {
+                    return true;
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "Keeping Rust metadata extern {} worktree-specific: {error:#}",
+                    metadata.display()
+                );
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn rust_arguments_for_worktree(
+    arguments: &[Argument<ArgData>],
+    context: Option<&GitWorktreeContext>,
+) -> Vec<Argument<ArgData>> {
+    let Some(context) = context else {
+        return arguments.to_owned();
+    };
+
+    let mut result = Vec::with_capacity(arguments.len() + 2);
+    for root in context.roots() {
+        let mut remap = root.as_os_str().to_owned();
+        remap.push("=.");
+        result.push(Argument::WithValue(
+            "--remap-path-prefix",
+            ArgData::PassThrough(remap),
+            ArgDisposition::Separated,
+        ));
+    }
+    result.extend(arguments.iter().cloned());
+    result
+}
+
+fn rewrite_cached_dep_info_targets(dep_info: &Path, outputs: &[FileObjectSource]) -> Result<()> {
+    let replacements = outputs
+        .iter()
+        .filter_map(|output| {
+            output
+                .path
+                .file_name()
+                .map(|name| (name.to_string_lossy().into_owned(), output.path.as_path()))
+        })
+        .collect::<HashMap<_, _>>();
+    let contents = fs::read_to_string(dep_info)
+        .with_context(|| format!("Failed to read dep-info file {}", dep_info.display()))?;
+    let mut changed = false;
+    let mut rewritten = String::with_capacity(contents.len());
+    for line in contents.split_inclusive('\n') {
+        let (line_without_newline, newline) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |line| (line, "\n"));
+        let Some((target, dependencies)) = line_without_newline.split_once(": ") else {
+            rewritten.push_str(line);
+            continue;
+        };
+        // rustc writes dep-info targets as native paths. In particular, Windows
+        // separators are literal backslashes rather than Makefile escapes.
+        let Some(file_name) = Path::new(target).file_name() else {
+            rewritten.push_str(line);
+            continue;
+        };
+        let Some(replacement) = replacements.get::<str>(&file_name.to_string_lossy()) else {
+            rewritten.push_str(line);
+            continue;
+        };
+        if Path::new(target) == *replacement {
+            rewritten.push_str(line);
+            continue;
+        }
+
+        changed = true;
+        rewritten.push_str(&replacement.to_string_lossy());
+        rewritten.push_str(": ");
+        rewritten.push_str(dependencies);
+        rewritten.push_str(newline);
+    }
+
+    if changed {
+        fs::write(dep_info, rewritten)
+            .with_context(|| format!("Failed to rewrite dep-info file {}", dep_info.display()))?;
+    }
+    Ok(())
+}
+
 /// Get absolute paths for all source files and env-deps listed in rustc's dep-info output.
 async fn get_source_files_and_env_deps<T>(
     creator: &T,
@@ -246,7 +567,7 @@ async fn get_source_files_and_env_deps<T>(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     pool: &tokio::runtime::Handle,
-) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
+) -> Result<RustDepInfo>
 where
     T: CommandCreatorSync,
 {
@@ -278,23 +599,28 @@ where
         })
         .await?;
 
-    parsed.map(move |(files, env_deps)| {
-        trace!(
-            "[{}]: got {} source files and {} env-deps from dep-info in {}",
-            crate_name,
-            files.len(),
-            env_deps.len(),
-            fmt_duration_as_secs(&start.elapsed())
-        );
-        // Just to make sure we capture temp_dir.
-        drop(temp_dir);
-        (files, env_deps)
-    })
+    let dep_info = parsed?;
+    trace!(
+        "[{}]: got {} source files and {} env-deps from dep-info in {}",
+        crate_name,
+        dep_info.source_files.len(),
+        dep_info.env_deps.len(),
+        fmt_duration_as_secs(&start.elapsed())
+    );
+    // Just to make sure we capture temp_dir.
+    drop(temp_dir);
+    Ok(dep_info)
+}
+
+struct RustDepInfo {
+    source_files: Vec<PathBuf>,
+    absolute_source_files: Vec<PathBuf>,
+    env_deps: Vec<(OsString, OsString)>,
 }
 
 /// Parse dependency info from `file` and return a Vec of files mentioned.
 /// Treat paths as relative to `cwd`.
-fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<(Vec<PathBuf>, Vec<(OsString, OsString)>)>
+fn parse_dep_file<T, U>(file: T, cwd: U) -> Result<RustDepInfo>
 where
     T: AsRef<Path>,
     U: AsRef<Path>,
@@ -302,14 +628,39 @@ where
     let mut f = fs::File::open(file.as_ref())?;
     let mut deps = String::new();
     f.read_to_string(&mut deps)?;
-    Ok((parse_dep_info(&deps, cwd), parse_env_dep_info(&deps)))
+    let source_paths = parse_dep_info_paths(&deps);
+    let absolute_source_files = source_paths
+        .iter()
+        .filter(|path| path.is_absolute())
+        .cloned()
+        .collect();
+    let mut source_files = source_paths
+        .into_iter()
+        .map(|path| cwd.as_ref().join(path))
+        .collect::<Vec<_>>();
+    source_files.sort();
+    Ok(RustDepInfo {
+        source_files,
+        absolute_source_files,
+        env_deps: parse_env_dep_info(&deps),
+    })
 }
 
+#[cfg(test)]
 fn parse_dep_info<T>(dep_info: &str, cwd: T) -> Vec<PathBuf>
 where
     T: AsRef<Path>,
 {
     let cwd = cwd.as_ref();
+    let mut deps = parse_dep_info_paths(dep_info)
+        .into_iter()
+        .map(|path| cwd.join(path))
+        .collect::<Vec<_>>();
+    deps.sort();
+    deps
+}
+
+fn parse_dep_info_paths(dep_info: &str) -> Vec<PathBuf> {
     // Just parse the first line, which should have the dep-info file and all
     // source files.
     let line = match dep_info.lines().next() {
@@ -351,9 +702,7 @@ where
         }
     }
 
-    let mut deps = deps.iter().map(|s| cwd.join(s)).collect::<Vec<_>>();
-    deps.sort();
-    deps
+    deps.into_iter().map(PathBuf::from).collect()
 }
 
 fn parse_env_dep_info(dep_info: &str) -> Vec<(OsString, OsString)> {
@@ -1048,6 +1397,7 @@ counted_array!(static ARGS: [ArgInfo<ArgData>; _] = [
     take_arg!("--pretty", OsString, CanBeSeparated(b'='), NotCompilation),
     take_arg!("--print", OsString, CanBeSeparated(b'='), NotCompilation),
     take_arg!("--remap-path-prefix", OsString, CanBeSeparated(b'='), PassThrough),
+    take_arg!("--remap-path-scope", OsString, CanBeSeparated(b'='), PassThrough),
     take_arg!("--sysroot", PathBuf, CanBeSeparated(b'='), TooHardPath),
     take_arg!("--target", ArgTarget, CanBeSeparated(b'='), Target),
     take_arg!("--unpretty", OsString, CanBeSeparated(b'='), NotCompilation),
@@ -1337,15 +1687,35 @@ where
         _cache_control: CacheControl,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
+        let git_worktree = discover_git_worktree(&cwd, &env_vars);
+        let compiler_arguments =
+            rust_arguments_for_worktree(&self.parsed_args.arguments, git_worktree.as_ref());
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
-        let os_string_arguments: Vec<(OsString, Option<OsString>)> = self
-            .parsed_args
-            .arguments
+        let os_string_arguments: Vec<(OsString, Option<OsString>)> = compiler_arguments
             .iter()
             .map(|arg| {
                 (
                     arg.to_os_string(),
                     arg.get_data().cloned().map(IntoArg::into_arg_os_string),
+                )
+            })
+            .collect();
+        let cache_key_arguments: Vec<(OsString, Option<OsString>)> = self
+            .parsed_args
+            .arguments
+            .iter()
+            .map(|argument| {
+                git_worktree.as_ref().map_or_else(
+                    || {
+                        (
+                            argument.to_os_string(),
+                            argument
+                                .get_data()
+                                .cloned()
+                                .map(IntoArg::into_arg_os_string),
+                        )
+                    },
+                    |context| normalize_worktree_argument(argument, context),
                 )
             })
             .collect();
@@ -1367,7 +1737,7 @@ where
         // Find all the source files and hash them
         let source_hashes_pool = pool.clone();
         let source_files_and_hashes_and_env_deps = async {
-            let (source_files, env_deps) = get_source_files_and_env_deps(
+            let dep_info = get_source_files_and_env_deps(
                 creator,
                 &self.parsed_args.crate_name,
                 &self.executable,
@@ -1377,8 +1747,8 @@ where
                 pool,
             )
             .await?;
-            let source_hashes = hash_all(&source_files, &source_hashes_pool).await?;
-            Ok((source_files, source_hashes, env_deps))
+            let source_hashes = hash_all(&dep_info.source_files, &source_hashes_pool).await?;
+            Ok((dep_info, source_hashes))
         };
 
         // Hash the contents of the externs listed on the commandline.
@@ -1422,19 +1792,48 @@ where
 
         let target_json_hash = hash_all(&target_json_files, pool);
 
+        #[cfg(feature = "dist-client")]
+        let proc_macro_detection = {
+            let externs = abs_externs.clone();
+            let crate_link_paths = self.parsed_args.crate_link_paths.clone();
+            let rlib_dep_reader = self.rlib_dep_reader.clone();
+            let env_vars = env_vars.clone();
+            pool.spawn_blocking(move || {
+                may_load_proc_macro(
+                    &externs,
+                    &crate_link_paths,
+                    rlib_dep_reader.as_deref(),
+                    &env_vars,
+                )
+            })
+        };
+        #[cfg(not(feature = "dist-client"))]
+        let proc_macro_detection = {
+            let externs = abs_externs.clone();
+            let crate_link_paths = self.parsed_args.crate_link_paths.clone();
+            pool.spawn_blocking(move || may_load_proc_macro(&externs, &crate_link_paths))
+        };
+        let proc_macro_detection = async move { proc_macro_detection.await.map_err(Error::from) };
+
         // Perform all hashing operations on the files.
         let (
-            (source_files, source_hashes, mut env_deps),
+            (dep_info, source_hashes),
             extern_hashes,
             staticlib_hashes,
             target_json_hash,
+            may_load_proc_macro,
         ) = futures::try_join!(
             source_files_and_hashes_and_env_deps,
             extern_hashes,
             staticlib_hashes,
-            target_json_hash
+            target_json_hash,
+            proc_macro_detection
         )?;
-
+        let RustDepInfo {
+            source_files,
+            absolute_source_files,
+            mut env_deps,
+        } = dep_info;
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
         // Hash inputs:
@@ -1445,6 +1844,34 @@ where
             m.update(d.as_bytes());
         }
         let weak_toolchain_key = m.clone().finish();
+        if let Some(context) = &git_worktree {
+            m.update(GIT_WORKTREES_CACHE_NAMESPACE);
+            context
+                .common_dir()
+                .hash(&mut HashToDigest { digest: &mut m });
+            if absolute_source_files
+                .iter()
+                .any(|path| worktree_relative_path(path, context).is_some())
+            {
+                // rustc does not apply object-only remapping to dep-info dependency paths.
+                // Keep entries with absolute worktree inputs local so a cache hit cannot
+                // restore a dependency path that belongs to another worktree.
+                m.update(b"absolute-worktree-source");
+                context.root().hash(&mut HashToDigest { digest: &mut m });
+            }
+            if has_user_path_remap_options(&self.parsed_args.arguments) {
+                // User remap prefixes and scopes take precedence over sccache's injected
+                // remap and may produce different objects. Keep these entries local.
+                m.update(b"user-path-remap-options");
+                context.root().hash(&mut HashToDigest { digest: &mut m });
+            }
+            if may_load_proc_macro {
+                // Proc macros can observe arbitrary environment variables without
+                // rustc reporting env-deps, including worktree-specific paths.
+                m.update(b"proc-macro-worktree");
+                context.root().hash(&mut HashToDigest { digest: &mut m });
+            }
+        }
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
         // normalize them so we can get cross-machine cache hits.
@@ -1452,7 +1879,7 @@ where
         // by cargo: --extern, -L, --cfg. We'll filter those out, sort them,
         // and append them to the rest of the arguments.
         let args = {
-            let (mut sortables, rest): (Vec<_>, Vec<_>) = os_string_arguments
+            let (mut sortables, rest): (Vec<_>, Vec<_>) = cache_key_arguments
                 .iter()
                 // We exclude a few arguments from the hash:
                 //   -L, --extern, --out-dir, --diagnostic-width
@@ -1488,13 +1915,20 @@ where
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
-        for h in source_hashes
-            .into_iter()
-            .chain(extern_hashes)
-            .chain(staticlib_hashes)
-            .chain(target_json_hash)
-        {
-            m.update(h.as_bytes());
+        if let Some(context) = &git_worktree {
+            hash_worktree_files(&mut m, &source_files, source_hashes, context);
+            hash_worktree_files(&mut m, &abs_externs, extern_hashes, context);
+            hash_worktree_files(&mut m, &abs_staticlibs, staticlib_hashes, context);
+            hash_worktree_files(&mut m, &target_json_files, target_json_hash, context);
+        } else {
+            for h in source_hashes
+                .into_iter()
+                .chain(extern_hashes)
+                .chain(staticlib_hashes)
+                .chain(target_json_hash)
+            {
+                m.update(h.as_bytes());
+            }
         }
         // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
         //    output. Additionally also has all environment variables starting with `CARGO_`,
@@ -1505,6 +1939,10 @@ where
             m.update(b"=");
             val.hash(&mut HashToDigest { digest: &mut m });
         }
+        let env_dep_names = env_deps
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<HashSet<_>>();
         let mut env_vars: Vec<_> = env_vars
             .iter()
             // Filter out RUSTC_COLOR since we control color usage with command line flags.
@@ -1534,10 +1972,22 @@ where
 
             var.hash(&mut HashToDigest { digest: &mut m });
             m.update(b"=");
-            val.hash(&mut HashToDigest { digest: &mut m });
+            if let Some(relative) = git_worktree.as_ref().and_then(|context| {
+                (!may_load_proc_macro && !env_dep_names.contains(var))
+                    .then(|| worktree_relative_cargo_env_path(Path::new(val), context))
+                    .flatten()
+            }) {
+                relative.hash(&mut HashToDigest { digest: &mut m });
+            } else {
+                val.hash(&mut HashToDigest { digest: &mut m });
+            }
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
-        cwd.hash(&mut HashToDigest { digest: &mut m });
+        if let Some(context) = &git_worktree {
+            hash_worktree_path(&mut m, &cwd, context);
+        } else {
+            cwd.hash(&mut HashToDigest { digest: &mut m });
+        }
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
@@ -1649,7 +2099,7 @@ where
                 },
             );
         }
-        let mut arguments = self.parsed_args.arguments.clone();
+        let mut arguments = compiler_arguments;
         // Request color output unless json was requested. The client will strip colors if needed.
         if !self.parsed_args.has_json {
             arguments.push(Argument::WithValue(
@@ -1680,6 +2130,7 @@ where
                 dep_info,
                 cwd,
                 env_vars,
+                git_worktrees: git_worktree.is_some(),
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: self.rlib_dep_reader.clone(),
             }),
@@ -1749,6 +2200,13 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         let dist_command = None;
         #[cfg(feature = "dist-client")]
         let dist_command = (|| {
+            if self.git_worktrees {
+                debug!(
+                    "Distributed Rust compilation is disabled when {GIT_WORKTREES_ENV} is enabled"
+                );
+                return None;
+            }
+
             macro_rules! try_string_arg {
                 ($e:expr) => {
                     match $e {
@@ -1851,6 +2309,25 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
         })();
 
         Ok((CCompileCommand::new(command), dist_command, Cacheable::Yes))
+    }
+
+    fn handle_cache_hit(&self, _outputs: &[FileObjectSource]) -> Result<()> {
+        if !self.git_worktrees {
+            return Ok(());
+        }
+        let Some(dep_info) = &self.dep_info else {
+            return Ok(());
+        };
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|(key, descriptor)| FileObjectSource {
+                key: key.clone(),
+                path: descriptor.path.clone(),
+                optional: descriptor.optional,
+            })
+            .collect::<Vec<_>>();
+        rewrite_cached_dep_info_targets(&self.cwd.join(dep_info), &outputs)
     }
 
     #[cfg(feature = "dist-client")]
@@ -2613,13 +3090,13 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
             break;
         }
 
-        let mut line_splits = line.splitn(2, ' ');
-        let num: usize = line_splits
+        let mut fields = line.split_whitespace();
+        let num: usize = fields
             .next()
             .expect("Zero strings from line split")
             .parse()
             .context("Could not parse number from rustc -Z ls")?;
-        let libstring = line_splits
+        let libstring = fields
             .next()
             .context("No lib string on line from rustc -Z ls")?;
         if num != dep_names.len() + 1 {
@@ -2628,8 +3105,6 @@ fn parse_rustc_z_ls(stdout: &str) -> Result<Vec<&str>> {
                 libstring
             )
         }
-        assert!(line_splits.next().is_none());
-
         let mut libstring_splits = libstring.rsplitn(2, '-');
         // Most things get printed as ${LIBNAME}-${HASH} but for some things
         // (native code-only libraries?), ${LIBNAME} is all you get.
@@ -2705,6 +3180,290 @@ host: x86_64-unknown-linux-gnu
 release: 1.66.1
 LLVM version: 15.0.2
 "#;
+
+    #[test]
+    fn git_worktrees_accepts_documented_true_value() {
+        let env = vec![(GIT_WORKTREES_ENV.into(), "1".into())];
+
+        assert!(git_worktrees_enabled(&env));
+    }
+
+    #[test]
+    fn git_worktrees_rejects_unknown_value() {
+        let env = vec![(GIT_WORKTREES_ENV.into(), "sometimes".into())];
+
+        assert!(!git_worktrees_enabled(&env));
+    }
+
+    #[test]
+    fn worktree_relative_paths_cannot_escape_through_parent_components() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repository");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::create_dir(root.join("src"))?;
+        fs::write(root.join("inside.rs"), "inside")?;
+        fs::write(temp.path().join("outside.rs"), "outside")?;
+        let context = GitWorktreeContext::discover(&root)?.expect("Git context");
+
+        assert_eq!(
+            worktree_relative_path(&root.join("src/../inside.rs"), &context),
+            Some(PathBuf::from("inside.rs"))
+        );
+        assert_eq!(
+            worktree_relative_path(&root.join("../outside.rs"), &context),
+            None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_relative_paths_do_not_follow_external_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repository");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join("inside.rs"), "inside")?;
+        let external_alias = temp.path().join("external.rs");
+        symlink(root.join("inside.rs"), &external_alias)?;
+        let context = GitWorktreeContext::discover(&root)?.expect("Git context");
+
+        assert_eq!(worktree_relative_path(&external_alias, &context), None);
+        assert_eq!(
+            worktree_relative_cargo_env_path(&external_alias, &context),
+            None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_env_paths_accept_a_whole_worktree_alias() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repository");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::create_dir(root.join("target"))?;
+        let alias = temp.path().join("repository-alias");
+        symlink(&root, &alias)?;
+        let context = GitWorktreeContext::discover(&root)?.expect("Git context");
+
+        assert_eq!(
+            worktree_relative_cargo_env_path(&alias.join("target"), &context),
+            Some(PathBuf::from("target"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worktree_remap_precedes_user_remaps() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir(temp.path().join(".git"))?;
+        let context = GitWorktreeContext::discover(temp.path())?.expect("Git context");
+        let user_remap = Argument::WithValue(
+            "--remap-path-prefix",
+            ArgData::PassThrough("src=user-src".into()),
+            ArgDisposition::Separated,
+        );
+
+        let arguments =
+            rust_arguments_for_worktree(std::slice::from_ref(&user_remap), Some(&context));
+
+        assert_eq!(arguments.last(), Some(&user_remap));
+        Ok(())
+    }
+
+    #[test]
+    fn worktree_remap_preserves_existing_scope() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        fs::create_dir(temp.path().join(".git"))?;
+        let context = GitWorktreeContext::discover(temp.path())?.expect("Git context");
+        let user_scope = Argument::WithValue(
+            "--remap-path-scope",
+            ArgData::PassThrough("macro".into()),
+            ArgDisposition::Separated,
+        );
+        let arguments =
+            rust_arguments_for_worktree(std::slice::from_ref(&user_scope), Some(&context));
+        let scopes = arguments
+            .iter()
+            .filter(|argument| argument.flag_str() == Some("--remap-path-scope"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(scopes, vec![&user_scope]);
+        Ok(())
+    }
+
+    #[test]
+    fn user_path_remap_options_are_detected() {
+        let prefix = Argument::WithValue(
+            "--remap-path-prefix",
+            ArgData::PassThrough("/workspace=redacted".into()),
+            ArgDisposition::Separated,
+        );
+        let scope = Argument::WithValue(
+            "--remap-path-scope",
+            ArgData::PassThrough("macro".into()),
+            ArgDisposition::Separated,
+        );
+
+        assert!(has_user_path_remap_options(&[prefix]));
+        assert!(has_user_path_remap_options(&[scope]));
+        assert!(!has_user_path_remap_options(&[]));
+    }
+
+    #[test]
+    fn dynamic_externs_may_be_proc_macros() {
+        let dynamic = PathBuf::from(format!("libderive.{DLL_EXTENSION}"));
+
+        assert!(is_dynamic_extern(&dynamic));
+        assert!(!is_dynamic_extern(Path::new("libdependency.rlib")));
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn worktree_mode_disables_distributed_compilation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let compilation = RustCompilation {
+            executable: "rustc".into(),
+            host: "test-host".into(),
+            sysroot: temp.path().join("sysroot"),
+            rlib_dep_reader: None,
+            arguments: Vec::new(),
+            inputs: Vec::new(),
+            outputs: HashMap::new(),
+            crate_link_paths: Vec::new(),
+            crate_name: "worktree_test".into(),
+            crate_types: CrateTypes {
+                rlib: true,
+                staticlib: false,
+            },
+            dep_info: None,
+            cwd: temp.path().to_owned(),
+            env_vars: Vec::new(),
+            git_worktrees: true,
+        };
+        let mut path_transformer = dist::PathTransformer::new();
+
+        let (_, dist_command, cacheable) = <RustCompilation as Compilation<
+            ProcessCommandCreator,
+        >>::generate_compile_commands(
+            &compilation, &mut path_transformer, false
+        )?;
+
+        assert!(dist_command.is_none());
+        assert_eq!(cacheable, Cacheable::Yes);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_dep_info_targets_are_rewritten_for_current_worktree() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dep_info = temp.path().join("target/current/example.d");
+        let output = temp.path().join("target/current/libexample.rlib");
+        fs::create_dir_all(dep_info.parent().expect("dep-info parent"))?;
+        fs::write(
+            &dep_info,
+            "/old/worktree/target/libexample.rlib: ./src/lib.rs\n\
+/old/worktree/target/example.d: ./src/lib.rs\n\
+./src/lib.rs:\n",
+        )?;
+        let outputs = vec![
+            FileObjectSource {
+                key: "libexample.rlib".into(),
+                path: output.clone(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "example.d".into(),
+                path: dep_info.clone(),
+                optional: false,
+            },
+        ];
+
+        rewrite_cached_dep_info_targets(&dep_info, &outputs)?;
+
+        let expected = format!(
+            "{}: ./src/lib.rs\n{}: ./src/lib.rs\n./src/lib.rs:\n",
+            output.display(),
+            dep_info.display()
+        );
+        assert_eq!(fs::read_to_string(dep_info)?, expected);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cached_dep_info_targets_preserve_windows_separators() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dep_info = temp.path().join("target/current/example.d");
+        let output = temp.path().join("target/current/example.rlib");
+        fs::create_dir_all(dep_info.parent().expect("dep-info parent"))?;
+        fs::write(
+            &dep_info,
+            "C:\\old\\worktree\\target\\example.rlib: src\\lib.rs\n\
+C:\\old\\worktree\\target\\example.d: src\\lib.rs\n",
+        )?;
+        let outputs = vec![
+            FileObjectSource {
+                key: "example.rlib".into(),
+                path: output.clone(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "example.d".into(),
+                path: dep_info.clone(),
+                optional: false,
+            },
+        ];
+
+        rewrite_cached_dep_info_targets(&dep_info, &outputs)?;
+
+        let contents = fs::read_to_string(&dep_info)?;
+        let output = output.to_string_lossy();
+        let dep_info = dep_info.to_string_lossy();
+        assert!(contents.contains(&*output));
+        assert!(contents.contains(&*dep_info));
+        assert!(!contents.contains("C:\\old\\worktree"));
+        Ok(())
+    }
+
+    #[test]
+    fn cached_dep_info_targets_preserve_relative_outputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dep_info = temp.path().join("target/current/example.d");
+        fs::create_dir_all(dep_info.parent().expect("dep-info parent"))?;
+        fs::write(
+            &dep_info,
+            "target/old/libexample.rlib: ./src/lib.rs\n\
+target/old/example.d: ./src/lib.rs\n\
+./src/lib.rs:\n",
+        )?;
+        let outputs = vec![
+            FileObjectSource {
+                key: "libexample.rlib".into(),
+                path: "target/current/libexample.rlib".into(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "example.d".into(),
+                path: "target/current/example.d".into(),
+                optional: false,
+            },
+        ];
+
+        rewrite_cached_dep_info_targets(&dep_info, &outputs)?;
+
+        assert_eq!(
+            fs::read_to_string(dep_info)?,
+            "target/current/libexample.rlib: ./src/lib.rs\n\
+target/current/example.d: ./src/lib.rs\n\
+./src/lib.rs:\n"
+        );
+        Ok(())
+    }
 
     #[test]
     #[allow(clippy::cognitive_complexity)]
@@ -3303,6 +4062,21 @@ proc_macro false
         assert_eq!(res[0], "lucet_runtime");
         assert_eq!(res[1], "lucet_runtime_internals");
         assert_eq!(res[2], "lucet_runtime_macros");
+    }
+
+    #[cfg(feature = "dist-client")]
+    #[test]
+    fn test_parse_rustc_z_ls_with_dependency_details() {
+        let output = "Crate info:
+name proc_macro_facade
+proc_macro false
+=External Dependencies=
+1 std-ca8536218e109c03 hash 7ae38cdd2212e7f2 host_hash None kind Unconditional public
+2 env_proc_macro hash 4661971025e3f187 host_hash None kind MacrosOnly public
+
+";
+        let res = parse_rustc_z_ls(output).unwrap();
+        assert_eq!(res, vec!["std", "env_proc_macro"]);
     }
 
     #[cfg(feature = "dist-client")]

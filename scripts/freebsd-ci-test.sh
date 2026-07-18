@@ -30,7 +30,7 @@
 # This script can be run from a github action. When run locally, make
 # sure to install the required packages:
 #
-#     pkg install -y ca-root-nss curl gmake gtar pot sudo
+#     pkg install -y ca-root-nss curl git gmake gtar pot sudo
 #
 
 # shellcheck disable=SC3040
@@ -63,6 +63,7 @@ output_env_info()
 	cargo -V
 	rustc -V
 	curl --version
+	git --version
 	# See https://github.com/bsdpot/pot/pull/253
 	pot version || true
 	gtar --version

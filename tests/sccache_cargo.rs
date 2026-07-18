@@ -106,6 +106,9 @@ fn test_rust_cargo_shares_cache_between_local_git_worktrees() -> Result<()> {
         "an absolute source input unexpectedly reused another worktree's entry"
     );
 
+    #[cfg(unix)]
+    ensure_external_symlink_spelling_isolated(&test_info, &repository)?;
+
     let user_remap = format!("{}=redacted", path_str(&repository)?);
     compile_direct_input(
         &test_info,
@@ -281,6 +284,44 @@ fn compile_absolute_input(test_info: &SccacheTest<'_>, root: &Path) -> Result<()
         Path::new("absolute-target"),
         None,
     )
+}
+
+#[cfg(unix)]
+fn ensure_external_symlink_spelling_isolated(
+    test_info: &SccacheTest<'_>,
+    root: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let external_alias = test_info.tempdir.path().join("external-input.rs");
+    symlink(root.join("src/lib.rs"), &external_alias)?;
+    compile_direct_input(
+        test_info,
+        root,
+        "symlink_input",
+        &external_alias,
+        Path::new("symlink-alias-target"),
+        None,
+    )?;
+    let hits_before_internal_spelling = rust_cache_stat("cache_hits")?;
+    let misses_before_internal_spelling = rust_cache_stat("cache_misses")?;
+    compile_direct_input(
+        test_info,
+        root,
+        "symlink_input",
+        &root.join("src/lib.rs"),
+        Path::new("symlink-internal-target"),
+        None,
+    )?;
+    ensure!(
+        rust_cache_stat("cache_misses")? > misses_before_internal_spelling,
+        "an external symlink spelling must not share the worktree-relative cache key"
+    );
+    ensure!(
+        rust_cache_stat("cache_hits")? == hits_before_internal_spelling,
+        "an external symlink spelling unexpectedly reused a worktree-relative entry"
+    );
+    Ok(())
 }
 
 fn compile_direct_input(

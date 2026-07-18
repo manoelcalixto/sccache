@@ -290,21 +290,41 @@ fn discover_git_worktree(
 }
 
 fn worktree_relative_path(path: &Path, context: &GitWorktreeContext) -> Option<PathBuf> {
-    let relative = context
-        .relative_path(path)
-        .filter(|relative| {
-            !relative
-                .components()
-                .any(|component| matches!(component, std::path::Component::ParentDir))
-        })
-        .map(Path::to_owned)
-        .or_else(|| {
-            if !path.is_absolute() {
-                return None;
-            }
-            let canonical = fs::canonicalize(path).ok()?;
-            context.relative_path(&canonical).map(Path::to_owned)
-        })?;
+    let lexical_relative = context.relative_path(path)?;
+    let relative = if lexical_relative
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        let canonical = fs::canonicalize(path).ok()?;
+        context.relative_path(&canonical)?.to_owned()
+    } else {
+        lexical_relative.to_owned()
+    };
+    Some(if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative
+    })
+}
+
+fn worktree_relative_cargo_env_path(path: &Path, context: &GitWorktreeContext) -> Option<PathBuf> {
+    if let Some(relative) = worktree_relative_path(path, context) {
+        return Some(relative);
+    }
+    if !path.is_absolute() {
+        return None;
+    }
+
+    // The process cwd may resolve a whole-worktree symlink while Cargo keeps
+    // spelling CARGO_* paths through it. Only accept that alternate spelling
+    // after proving that it discovers the same Git metadata. A standalone
+    // symlink to a file inside the worktree has no such Git root.
+    let alias_context = GitWorktreeContext::discover(path).ok().flatten()?;
+    if alias_context.common_dir() != context.common_dir() {
+        return None;
+    }
+    let canonical = fs::canonicalize(path).ok()?;
+    let relative = context.relative_path(&canonical)?.to_owned();
     Some(if relative.as_os_str().is_empty() {
         PathBuf::from(".")
     } else {
@@ -1954,7 +1974,7 @@ where
             m.update(b"=");
             if let Some(relative) = git_worktree.as_ref().and_then(|context| {
                 (!may_load_proc_macro && !env_dep_names.contains(var))
-                    .then(|| worktree_relative_path(Path::new(val), context))
+                    .then(|| worktree_relative_cargo_env_path(Path::new(val), context))
                     .flatten()
             }) {
                 relative.hash(&mut HashToDigest { digest: &mut m });
@@ -3192,6 +3212,47 @@ LLVM version: 15.0.2
         assert_eq!(
             worktree_relative_path(&root.join("../outside.rs"), &context),
             None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_relative_paths_do_not_follow_external_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repository");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join("inside.rs"), "inside")?;
+        let external_alias = temp.path().join("external.rs");
+        symlink(root.join("inside.rs"), &external_alias)?;
+        let context = GitWorktreeContext::discover(&root)?.expect("Git context");
+
+        assert_eq!(worktree_relative_path(&external_alias, &context), None);
+        assert_eq!(
+            worktree_relative_cargo_env_path(&external_alias, &context),
+            None
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_env_paths_accept_a_whole_worktree_alias() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repository");
+        fs::create_dir_all(root.join(".git"))?;
+        fs::create_dir(root.join("target"))?;
+        let alias = temp.path().join("repository-alias");
+        symlink(&root, &alias)?;
+        let context = GitWorktreeContext::discover(&root)?.expect("Git context");
+
+        assert_eq!(
+            worktree_relative_cargo_env_path(&alias.join("target"), &context),
+            Some(PathBuf::from("target"))
         );
         Ok(())
     }

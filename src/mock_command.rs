@@ -256,6 +256,7 @@ impl RunCommand for AsyncCommand {
         let token = self.jobserver.acquire().await?;
         let mut inner = tokio::process::Command::from(inner);
         let child = inner
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to spawn {:?}", inner))?;
 
@@ -404,6 +405,10 @@ impl CommandChild for MockChild {
 
 pub enum ChildOrCall {
     Child(Result<MockChild>),
+    #[allow(
+        dead_code,
+        reason = "Read in the async_trait below, but rustc doesn't see it as used"
+    )]
     Call(Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>),
 }
 
